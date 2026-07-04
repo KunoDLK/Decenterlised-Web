@@ -1,54 +1,108 @@
 # Decentralized File Storage Network (Python + UDP Hole Punching)
 
-**TL;DR** — A self-organizing decentralized storage network. Each peer runs a Python backend for UDP P2P networking and serves an HTML frontend via Flask for the UI. Peers discover each other via single-scan QR codes, broadcast UDP (LAN), or hardcoded bootstrap peers. Files replicated dynamically. Public/private keypairs for identity and file authorship verification.
+**TL;DR** — A self-organizing decentralized storage network. Each peer runs a Python process with a terminal UI (peer list, file search, status) and optionally a web UI on a separate port. Peers discover each other via single-scan QR codes, broadcast UDP (LAN), or hardcoded bootstrap peers. Identity is derived from a username + password (deterministic keypair — same credentials on any device = same identity). Files replicated dynamically.
 
 ---
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Python Peer Process                     │
-│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────┐ │
-│  │ Identity │  │ UDP Engine│  │ Peer     │  │ File    │ │
-│  │ (Ed25519)│  │ (P2P)     │  │ Book     │  │ Store   │ │
-│  └──────────┘  └─────┬─────┘  │ (SQLite) │  │(on disk)│ │
-│                      │         └──────────┘  └─────────┘ │
-│  ┌──────────┐  ┌─────┴─────┐  ┌──────────┐              │
-│  │ File     │  │ Protocol  │  │ Storage  │              │
-│  │ Registry │  │ Router    │  │ Manager  │              │
-│  └──────────┘  └─────┬─────┘  └──────────┘              │
-│                      │                                    │
-│  ┌───────────────────┴───────────────────────────────┐   │
-│  │  Flask HTTP Server                                │   │
-│  │  ┌──────────────┐  ┌───────────────────────────┐  │   │
-│  │  │ Static HTML  │  │ WebSocket (real-time UI)  │  │   │
-│  │  │ /CSS/JS      │  │ /ws                        │  │   │
-│  │  └──────────────┘  └───────────────────────────┘  │   │
-│  └───────────────────┬───────────────────────────────┘   │
-└──────────────────────┼───────────────────────────────────┘
-                       │ HTTP + WebSocket (localhost)
-┌──────────────────────┴───────────────────────────────────┐
-│  Browser Frontend (same dark mode UI design)              │
-│  UI: File List │ QR Code │ Upload │ Settings │ Storage   │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    Python Peer Process                        │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌────────────┐ │
+│  │ Identity │  │ UDP Engine│  │ Peer     │  │ File       │ │
+│  │(KDF from │  │ (P2P)     │  │ Book     │  │ Store      │ │
+│  │user+pass)│  └─────┬─────┘  │ (SQLite) │  │(on disk)   │ │
+│  └──────────┘        │         └──────────┘  └────────────┘ │
+│                      │                                        │
+│  ┌──────────┐  ┌─────┴─────┐  ┌──────────┐                  │
+│  │ File     │  │ Protocol  │  │ Storage  │                  │
+│  │ Registry │  │ Router    │  │ Manager  │                  │
+│  └──────────┘  └───────────┘  └──────────┘                  │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Terminal UI (default)         [--no-tui to disable] │   │
+│  │  ┌────────────────────────────────────────────────┐  │   │
+│  │  │  Peers: 4 online    Files: 12    Storage: 45%  │  │   │
+│  │  │  > search: photo                                │  │   │
+│  │  │  📄 photo.jpg  2.4MB  👁 3  author: alice      │  │   │
+│  │  │  🖼️  photo2.png 1.2MB  👁 5  author: bob       │  │   │
+│  │  └────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                              │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  Flask HTTP Server (optional, port configurable)     │   │
+│  │  ┌──────────────┐  ┌──────────────────────────────┐  │   │
+│  │  │ Static HTML  │  │ WebSocket (real-time UI)     │  │   │
+│  │  │ /CSS/JS      │  │ /ws  (admin auth required)   │  │   │
+│  │  └──────────────┘  └──────────────────────────────┘  │   │
+│  └──────────────────────┬───────────────────────────────┘   │
+└─────────────────────────┼───────────────────────────────────┘
+                          │ HTTP + WebSocket (separate port)
+┌─────────────────────────┴───────────────────────────────────┐
+│  Browser Frontend  (dark mode UI, login with admin creds)    │
+│  UI: File List │ QR Code │ Upload │ Settings │ Storage      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Dependencies:** Python 3.10+, Flask, flask-sock (WebSocket). No external P2P libraries — raw UDP sockets + `cryptography` for Ed25519.
+**Dependencies:** Python 3.10+, Flask, flask-sock (WebSocket), `cryptography` (Ed25519 + KDF), `rich` (terminal UI). No external P2P libraries — raw UDP sockets.
 
-### 1. Node Identity (Ed25519 Keypair)
+### 1. Identity (Two Separate Layers)
 
-- Generate an **Ed25519** keypair on first run using Python's `cryptography` library
-- Node ID = first 16 chars of SHA-256 hash of the public key bytes
-- Persist keypair to `~/.decentralised-web/identity.json` (JSON with base64-encoded key bytes)
-- **All protocol messages include sender Node ID**
-- File operations (publish, update) are **signed** with the private key — receivers verify with the public key
-- Ed25519 chosen over ECDSA P-256: faster signing, smaller signatures (64 bytes), simpler API
+#### 1a. Node Identity (Peer ID — Random)
+
+Each Python process has its own **node identity**: a random Ed25519 keypair generated on first run, persisted to `~/.decentralised-web/node_identity.json`. This keypair:
+- Identifies the node on the P2P network (Node ID = first 16 chars of SHA-256 of public key)
+- Signs protocol-level messages (`hello`, `file_announce`, `peer_list_response`, etc.)
+- Has **no relationship** to who is operating the node or what files it hosts
+- Regenerated if the identity file is deleted (node gets a new ID)
+
+This is the identity other peers see: "node a1b2c3 is online, uptime 2h, hosting files X, Y, Z."
+
+#### 1b. File Author Identity (Username + Password — Deterministic)
+
+A separate identity derived from **username + password** via PBKDF2-HMAC-SHA256 (600K iterations, salt `decentralised-web-v1`) seeding an Ed25519 keypair. This:
+- Is the same on any device — log in with `-u alice -p secret` anywhere, get the same author identity
+- Signs **file operations only**: `file_publish`, `file_update`, `file_delete`
+- Receivers verify signatures against the author's public key to confirm authorship
+- Has **no relationship** to the node identity — alice can publish files from any node
+- Author public key is included in file registry entries so anyone can verify
+
+#### 1c. Web UI Authentication (Username + Password — Same as Author)
+
+The web UI login form accepts the same username + password. On successful login:
+- The browser is authenticated to manage the server (upload files, trigger downloads, configure storage)
+- File operations performed via the web UI are signed with the **author's** derived keypair, not the node's key
+- This means: log into a remote node's web UI as alice → upload file → it's signed as alice → network recognises alice as the author → later, alice can push an update from any other node
+
+#### 1d. Remote Login Rules
+
+When a user logs into a **remote node** (a node whose local node identity is not their own):
+
+**Publishing new files** — allowed only if:
+- At least one node where the user previously logged in is currently **online** (the user is contributing to the network), OR
+- The remote node will host the file (it becomes the contributor on the user's behalf)
+
+**Modifying / deleting files** — always allowed:
+- The user can prove authorship via their Ed25519 signature on the update/delete message
+- The operation is valid regardless of which node initiates it
+- If the user's home node was offline and comes back, it queries the network, discovers the file was updated, and syncs the latest version. No files are ever frozen.
+
+**Browse-only fallback:** If the user has never contributed (0 files on network) AND the remote node has no spare storage to host a new file, the login succeeds but only browse/download mode is available.
+
+**Summary of the three identities:**
+
+| Identity | How derived | Persisted | Used for |
+|---|---|---|---|
+| **Node ID** | Random Ed25519 | `node_identity.json` | P2P protocol messages, peer discovery |
+| **Author ID** | PBKDF2(username+password) → Ed25519 | In-memory only (session) | Signing file operations (publish, update, delete) |
+| **Web auth** | Same username+password | Flask session cookie | Authenticating to web UI to manage server |
 
 ### 2. Peer Discovery
 
 #### 2a. QR Code Discovery (Single Scan)
-- Each node generates a connection URL: `https://<bootstrapper>/?join=<nodeId>&pk=<base64PublicKey>&addr=<publicIP>:<publicPort>`
+- Each node generates a connection URL: `https://<bootstrapper>/?join=<nodeId>&pk=<base64NodePublicKey>&addr=<publicIP>:<publicPort>`
+- `nodeId` and `nodePublicKey` are the node's random peer identity (not the author identity)
 - The `addr` parameter is the node's public IP:port (obtained via STUN — see §3b)
 - URL encoded as QR code. ~150 bytes — easily scannable
 - Another user scans the QR → browser sends the peer info to the local Python backend via WebSocket → backend initiates UDP hole punching to the target address
@@ -129,7 +183,7 @@ A ══════════ Direct UDP connection established ════�
 - After introduction, both sides attempt mutual hole punching
 - If peer-assisted also fails → peer pair is unreachable. Accept the loss (~5% of NAT combinations).
 - On next startup, retry direct first. Only fall back to assisted if direct fails again.
-#### 3c. Reliability Layer
+#### 3d. Reliability Layer
 UDP drops packets (~1% on healthy networks). A thin reliability layer sits above raw UDP:
 
 - Every message has a **sequence number** (monotonically increasing per peer pair)
@@ -137,7 +191,7 @@ UDP drops packets (~1% on healthy networks). A thin reliability layer sits above
 - Non-critical messages (pings, gossip updates) are fire-and-forget — loss is acceptable
 - Duplicate detection via sequence numbers — re-sent packets are silently dropped
 
-#### 3d. Wire Format
+#### 3e. Wire Format
 All messages use a compact binary format (not JSON — smaller, faster to parse):
 
 ```
@@ -150,7 +204,7 @@ Total overhead: 19 bytes per message. Message types use the same names as the pr
 
 ### 4. Protocol Messages
 
-All messages use the binary wire format from §3d. Message types are uint16 IDs. Payloads use a compact binary encoding (not JSON) — integer lengths, fixed-width fields, length-prefixed strings.
+All messages use the binary wire format from §3e. Message types are uint16 IDs. Payloads use a compact binary encoding (not JSON) — integer lengths, fixed-width fields, length-prefixed strings.
 
 | Message Type | ID | Direction | Purpose |
 |---|---|---|---|
@@ -332,13 +386,80 @@ On startup (process restart):
 - Peers that fail to connect 5+ consecutive attempts: demote one tier
 - **UDP NAT mapping expiry**: keepalive pings every 30 seconds refresh the hole. If a peer misses 3 consecutive pings (90s), consider disconnected.
 
-### 10. UI Design (Dark Mode)
+### 10. Terminal UI (TUI — Default Interface)
 
-#### Layout Structure
+By default, running `python app.py` launches an interactive terminal UI. This is the primary interface for headless/server operation and local development (running multiple instances on the same machine for testing).
+
+#### 10a. TUI Layout
+
+```
+┌── Decentralised Web ──────────────────── peers: 4 ──── files: 12 ── storage: 45% ──┐
+│                                                                                    │
+│  [Connected Peers]                                                                 │
+│  a1b2c3  alice      🟢 online   2h 14m uptime    203.0.113.5:49152                │
+│  d4e5f6  bob        🟢 online   45m uptime       198.51.100.3:52833               │
+│  g7h8i9  carol      🟡 assisted 12m uptime       (via alice)                      │
+│  j0k1l2  dave       🔴 offline  last seen 3h ago                                  │
+│                                                                                    │
+│  [Search: photo________________]  (type to filter files)                          │
+│                                                                                    │
+│  📄 photo.jpg      2.4MB  👁 3   author: alice    [d]ownload                       │
+│  🖼️  photo2.png     1.2MB  👁 5   author: bob      [d]ownload                       │
+│  📊 data.json       12KB  👁 1⚠️ author: carol    [d]ownload  [r]eplicate          │
+│                                                                                    │
+│  [My Published Files] (tab: m)                                                     │
+│  📄 report.pdf      156KB  👁 2   [u]pdate  [x]delete                             │
+│  🖼️  cat.png        1.2MB  👁 4   [u]pdate  [x]delete                             │
+│                                                                                    │
+│  [h]elp  [q]uit  [s]tats  [p]ublish file  [c]onnect to peer  [l]ogin              │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 10b. TUI Features
+
+- **Real-time updates**: peer list, file registry, and storage stats refresh live via the same event loop as the UDP engine
+- **Search**: type to filter network files. Press Enter to select, `d` to download, `r` to trigger replication
+- **Tabs**: `[1]` Network Files, `[2]` My Published Files, `[3]` Local Storage, `[4]` Peer Book
+- **Publish**: `p` opens a file picker (via `tkinter` or CLI path input) → file is published to the network
+- **Manual connect**: `c` prompts for a peer address (ip:port or connection URL) to manually join
+- **Login**: `l` prompts for username + password → derives author keypair → enables file publishing/updating as that author. Without login, the node can browse and download but cannot publish or update files.
+- **Disable TUI**: `python app.py --no-tui` runs in headless mode (pure logging output). Useful for servers.
+- **Framework**: Built with `rich` library for cross-platform terminal UI (tables, panels, live updates)
+- **Multiple instances**: Run `python app.py --port 9001 --tui-port-offset 100` to shift all ports, allowing multiple instances on the same machine without port conflicts
+
+#### 10c. CLI Arguments
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--user` / `-u` | (env: `DECWEB_USER`) | Author username for signing file operations. Optional — without it, the node can browse/download but not publish. |
+| `--pass` / `-p` | (env: `DECWEB_PASS`) | Author password for signing file operations. |
+| `--port` / `-P` | 9000 | UDP listen port for P2P |
+| `--no-tui` | false | Disable terminal UI (headless mode) |
+| `--web-port` | 9001 | Port for the Flask web UI (0 = disabled) |
+| `--web-host` | `127.0.0.1` | Bind address for web UI (`0.0.0.0` for LAN access) |
+| `--data-dir` | `~/.decentralised-web` | Data directory for SQLite DBs + file store |
+| `--storage-limit` | 500 (MB) | Maximum disk storage for peer replicas |
+| `--no-lan` | false | Disable LAN broadcast discovery |
+
+### 11. Web UI (Dark Mode — Optional)
+
+The web UI runs on a **separate port** (default: 9001) and serves the same visual interface described below. Set `--web-port 0` to disable entirely.
+
+#### 11a. Authentication
+
+- On first load, the web UI shows a **login form** (username + password)
+- Credentials derive the **author keypair** (see §1b) — this is NOT the node's identity
+- On successful login: WebSocket connection established, UI renders the full file management interface
+- File operations performed via the web UI are signed with the author's key
+- The web UI acts as a **remote control** for the server — managing files hosted on that server, triggering downloads, viewing the network
+- Session persists via Flask session cookie. Logout available from the title bar.
+- Without login: browse-only mode (view files, see peers, cannot publish/update/delete). Login enables full access per the remote login rules in §1d.
+
+#### 11b. Layout Structure
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  🏷️ Kuno's Net    [📡 Share Network]                    [👤 a1b2] │  ← Title bar
+│  🏷️ Kuno's Net  alice [📡 Share Network]         [👤 a1b2] [⏻] │  ← Title bar
 ├──────────┬───────────────────────────────────────────────────────┤
 │          │  [ My Files ]  [ Browse ]      [+ Upload]  🔍 Search  │
 │ ┌──────┐ │  ┌──────────────────────────────────────────────────┐ │
@@ -362,15 +483,17 @@ On startup (process restart):
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-#### 10a. Title Bar (top, full width)
+#### 11c. Title Bar (top, full width)
 
 | Element | Position | Behavior |
 |---|---|---|
 | **Network name** (e.g. "Kuno's Net") | Left | User-configurable display name. Defaults to auto-generated but editable |
-| **Share Network** button | Left, after name | Reopens the QR code panel if collapsed |
-| **Node ID** | Right | Truncated node ID (first 8 chars), click to copy full ID |
+| **Author username** | Left, after name | Shows logged-in author (e.g. "alice"). Blank if not logged in. Click to re-login |
+| **Share Network** button | Left, after username | Reopens the QR code panel if collapsed |
+| **Node ID** | Right | Truncated node ID (first 8 chars), click to copy. This is the random node identity |
+| **Logout** button | Right, after Node ID | Clears author session, reverts to browse-only mode |
 
-#### 10b. Peer Join/Share Panel (left side, collapsible)
+#### 11d. Peer Join/Share Panel (left side, collapsible)
 
 - Default: **open** on first visit (no peers connected yet)
 - **Collapses automatically** once the node has 2+ connected peers. Clicking **[📡 Share Network]** in the title bar reopens it
@@ -405,7 +528,7 @@ Contains three ways to join/share:
 
 **Scan QR of Peer:** Uses the device camera (`getUserMedia` with `video` constraint) to scan another peer's QR code. On successful scan: parse URL → Python backend sends UDP hello packets to the target `addr` → existing peer replies → hole punched → connection established. Single scan, single direction. No response QR needed — the existing node is already listening on its known port.
 
-#### 10c. Center Panel — File Lists (tabs)
+#### 11e. Center Panel — File Lists (tabs)
 
 Two tabs sharing the same layout and controls:
 
@@ -443,7 +566,7 @@ Shows: icon, file name, file type, size, replica count (with warning ⚠️ if u
 
 **[+ Upload File] button**: In the tab header area (next to the search box). Triggers a native file picker (`<input type="file">`). On selection, the file is published per §8. Supported on both tabs — on Browse tab, uploads appear in "My Files" after publishing.
 
-#### 10d. Bottom Bar — Storage Health (full width)
+#### 11f. Bottom Bar — Storage Health (full width)
 
 Shows a compact overview of the node's storage and network health:
 
@@ -466,7 +589,7 @@ Shows a compact overview of the node's storage and network health:
 
 Transitions are debounced — don't flash red/amber on a brief disconnect.
 
-#### 10e. Temporary Peer Storage (Open/Download behaviour)
+#### 11g. Temporary Peer Storage (Open/Download behaviour)
 
 When a user clicks **Open File** or **Download**:
 1. File is downloaded via UDP from a known peer (reliable chunks with ACK)
@@ -489,9 +612,10 @@ This means **popular files naturally accumulate many replicas** as users open th
 
 | File | Purpose |
 |---|---|
-| `app.py` | Main entry point — initializes all modules, starts Flask server |
-| `identity.py` | Ed25519 keypair generation, signing, verification (cryptography library) |
-| `udp_engine.py` | UDP socket, hole punching, STUN query, send/recv, keepalive pings |
+| `app.py` | Main entry point — CLI arg parsing, TUI launch, UDP engine, optional Flask server |
+| `identity.py` | Random node keypair generation (persisted), PBKDF2 author key derivation (session-only), signing, verification |
+| `tui.py` | Terminal UI using `rich` — live peer list, file search, tabs, keyboard shortcuts |
+| `udp_engine.py` | UDP socket, hole punching, STUN query, send/recv, keepalive pings, peer-assisted connection |
 | `reliable.py` | Reliability layer: sequence numbers, ACKs, retransmit, duplicate detection |
 | `protocol.py` | Binary message encoding/decoding, message routing, gossip logic |
 | `peer_book.py` | SQLite-backed peer directory, tiering, cleanup |
@@ -499,41 +623,43 @@ This means **popular files naturally accumulate many replicas** as users open th
 | `file_registry.py` | Local file registry with gossip sync, SQLite-backed |
 | `storage.py` | Disk file storage, quota tracking, rebalancing triggers |
 | `replication.py` | Replica counting, solicitation, rebalancing logic |
-| `web/` | Flask app directory |
-| `web/app.py` | Flask routes: serve HTML, WebSocket endpoint, file download endpoint |
-| `web/templates/index.html` | Main HTML structure, dark mode UI layout |
+| `web/` | Flask web UI (optional, on separate port) |
+| `web/app.py` | Flask routes: serve HTML, WebSocket endpoint (auth-gated), file download endpoint |
+| `web/templates/index.html` | Login form + main UI layout (dark mode) |
+| `web/templates/login.html` | Username + password login form |
 | `web/static/style.css` | Dark mode styling |
-| `web/static/app.js` | Frontend JS: WebSocket connection, DOM manipulation, QR display |
+| `web/static/app.js` | Frontend JS: login, WebSocket connection, DOM manipulation, QR display |
 | `web/static/qrcode.min.js` | QR code generation library (single-file include) |
-| `requirements.txt` | Python dependencies: flask, flask-sock, cryptography |
+| `requirements.txt` | Python dependencies: flask, flask-sock, cryptography, rich |
 
 ---
 
 ## Verification Plan
 
-1. **Startup**: Run `python app.py` — Flask starts, browser opens, peer connects to bootstrap/LAN.
-2. **QR Discovery**: Open on two devices. Device A shows QR → device B scans → connection established via UDP hole punch within 1 second.
-3. **LAN Discovery**: Two devices on same WiFi — auto-discover via broadcast UDP, connect with zero user action.
-4. **Gossip reconnect**: Close device B's process. Restart. Verify it reconnects to A via peer book (SQLite) — no QR needed.
-5. **File publish**: Upload a file on A. Verify it appears in B's file list within seconds.
-6. **Download**: Click download on B. Verify file transfers from A via UDP with reliable chunks.
-7. **Replication**: Upload file on A. Disconnect A. Verify B solicits a third peer (C) to replicate.
-8. **Rebalancing**: Fill storage with over-replicated files. Verify node deletes excess and stores vulnerable files.
-9. **File update**: Update a file from A (original author). Verify B verifies the Ed25519 signature.
+1. **TUI launch**: Run `python app.py -u alice -p secret` → TUI appears, node generates identity, starts listening.
+2. **Multi-instance**: Run two instances with `--port 9001` and `--port 9002` on same machine. Verify they connect via LAN broadcast or manual `c` connect.
+3. **QR Discovery**: Device A shows QR (web UI or copied link). Device B scans → UDP hole punch → connection within 1 second.
+4. **Deterministic identity**: Run with `-u alice -p secret` on two different machines. Verify they produce the same Node ID and public key.
+5. **Web UI login**: Open `http://localhost:9001` → login form → enter server's credentials → WebSocket connects → full UI renders.
+6. **File publish**: Upload file via TUI (`p`) or web UI. Verify it appears in other peers' file lists.
+7. **Download**: Click download in web UI or press `d` in TUI → file transfers via UDP with reliable chunks.
+8. **Replication + rebalancing**: As per original verification plan.
 
 ---
 
 ## Decisions
 
-- **Ed25519** for identity — fast signing, small signatures (64 bytes), simple Python API via `cryptography`.
+- **PBKDF2-derived Ed25519** keypair from username + password — portable identity, no key files to lose or sync. Same credentials on any device = same node.
+- **Terminal UI by default** (`rich` library) — enables running multiple instances locally, headless server mode via `--no-tui`.
+- **Web UI on separate port** with admin login — remote management, same credentials as the server identity.
 - **UDP with reliability layer** — no WebRTC ceremony. Hole punching takes <500ms vs 2-5s for ICE+DTLS.
-- **Binary wire format** — 19-byte header, compact. No JSON parsing overhead on UDP payloads.
-- **SQLite** for peer book and file registry — fast, persistent, no browser storage limits.
-- **Disk storage** for files — GB-scale vs browser's ~500MB in-memory limit.
-- **STUN only** — same Google STUN server. UDP hole punching succeeds for ~85% of NATs (same as WebRTC).
-- **Bootstrap peers + LAN broadcast** — auto-join without QR in most scenarios. QR is a fallback.
-- **Eventual consistency** — gossip + timestamps. No blockchain, no consensus.
-- **Honest node assumption** — no Sybil protection, no proof-of-storage. Tech demo.
+- **Binary wire format** — 19-byte header, compact.
+- **SQLite** for peer book and file registry.
+- **Disk storage** for files — GB-scale, default 500MB cap.
+- **STUN only** — same Google STUN. ~85% success, peer-assisted fallback for symmetric NAT.
+- **Bootstrap peers + LAN broadcast + peer book** — auto-join without QR in most scenarios. QR is fallback.
+- **Eventual consistency** — gossip + timestamps.
+- **Honest node assumption** — tech demo.
 
 ---
 

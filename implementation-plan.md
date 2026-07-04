@@ -1,33 +1,90 @@
 # Decentralised File Storage Network — Detailed Implementation Plan
 
 ## Table of Contents
-1. [Project Structure](#1-project-structure)
-2. [Dependency Graph](#2-dependency-graph)
-3. [Module-by-Module Specification](#3-module-by-module-specification)
-   - [3.1 `identity.py` — Identity & Cryptography](#31-identitypy--identity--cryptography)
-   - [3.2 `wire.py` — Binary Wire Format](#32-wirepy--binary-wire-format)
-   - [3.3 `reliable.py` — Reliability Layer](#33-reliablepy--reliability-layer)
-   - [3.4 `protocol.py` — Protocol Message Definitions & Router](#34-protocolpy--protocol-message-definitions--router)
-   - [3.5 `stun.py` — STUN Client](#35-stunpy--stun-client)
-   - [3.6 `udp_engine.py` — UDP Socket & Hole Punching](#36-udp_enginepy--udp-socket--hole-punching)
-   - [3.7 `connection.py` — Per-Peer Connection State](#37-connectionpy--per-peer-connection-state)
-   - [3.8 `peer_book.py` — SQLite Peer Directory](#38-peer_bookpy--sqlite-peer-directory)
-   - [3.9 `file_registry.py` — Decentralised File Registry](#39-file_registrypy--decentralised-file-registry)
-   - [3.10 `storage.py` — Disk Storage & Quota Manager](#310-storagepy--disk-storage--quota-manager)
-   - [3.11 `replication.py` — Rebalancing & Diversity Logic](#311-replicationpy--rebalancing--diversity-logic)
-   - [3.12 `tui.py` — Terminal UI](#312-tuipy--terminal-ui)
-   - [3.13 `web/__init__.py` — Flask App Factory](#313-webinitpy--flask-app-factory)
-   - [3.14 `web/routes.py` — HTTP Routes](#314-webroutespy--http-routes)
-   - [3.15 `web/ws.py` — WebSocket Handler](#315-webwspy--websocket-handler)
-   - [3.16 `web/templates/index.html` — Main UI](#316-webtemplatesindexhtml--main-ui)
-   - [3.17 `web/templates/login.html` — Login Page](#317-webtemplatesloginhtml--login-page)
-   - [3.18 `web/static/style.css` — Dark Mode Styles](#318-webstaticstylecss--dark-mode-styles)
-   - [3.19 `web/static/app.js` — Frontend Logic](#319-webstaticappjs--frontend-logic)
-   - [3.20 `app.py` — Main Entry Point](#320-apppy--main-entry-point)
-4. [Data Flow Diagrams](#4-data-flow-diagrams)
-5. [Startup & Reconnection Sequence](#5-startup--reconnection-sequence)
-6. [File Lifecycle](#6-file-lifecycle)
-7. [Error Handling Strategy](#7-error-handling-strategy)
+- [Decentralised File Storage Network — Detailed Implementation Plan](#decentralised-file-storage-network--detailed-implementation-plan)
+  - [Table of Contents](#table-of-contents)
+  - [1. Project Structure](#1-project-structure)
+  - [2. Dependency Graph](#2-dependency-graph)
+  - [3. Module-by-Module Specification](#3-module-by-module-specification)
+    - [3.1 `identity.py` — Identity \& Cryptography](#31-identitypy--identity--cryptography)
+      - [Constants](#constants)
+      - [Class: `NodeIdentity`](#class-nodeidentity)
+      - [Class: `AuthorIdentity`](#class-authoridentity)
+      - [Free Functions](#free-functions)
+    - [3.2 `wire.py` — Binary Wire Format](#32-wirepy--binary-wire-format)
+      - [Wire Format (repeated from spec)](#wire-format-repeated-from-spec)
+      - [Class: `WireMessage`](#class-wiremessage)
+      - [Free Functions](#free-functions-1)
+      - [Helper: `PayloadBuilder` class](#helper-payloadbuilder-class)
+      - [Helper: `PayloadReader` class](#helper-payloadreader-class)
+    - [3.3 `reliable.py` — Reliability Layer](#33-reliablepy--reliability-layer)
+      - [Class: `ReliabilityManager`](#class-reliabilitymanager)
+      - [`PendingMessage` dataclass](#pendingmessage-dataclass)
+    - [3.4 `protocol.py` — Protocol Message Definitions \& Router](#34-protocolpy--protocol-message-definitions--router)
+      - [Constants — Message Type IDs](#constants--message-type-ids)
+      - [Dataclasses — Typed Message Payloads](#dataclasses--typed-message-payloads)
+      - [Class: `MessageBuilder`](#class-messagebuilder)
+      - [Class: `MessageParser`](#class-messageparser)
+      - [Class: `ProtocolRouter`](#class-protocolrouter)
+    - [3.5 `stun.py` — STUN Client](#35-stunpy--stun-client)
+      - [Constants](#constants-1)
+      - [Free Function](#free-function)
+    - [3.6 `udp_engine.py` — UDP Socket \& Hole Punching](#36-udp_enginepy--udp-socket--hole-punching)
+      - [Class: `UDPEngine`](#class-udpengine)
+      - [`ConnectionState` dataclass](#connectionstate-dataclass)
+      - [`UploadState` dataclass](#uploadstate-dataclass)
+      - [`DownloadState` dataclass](#downloadstate-dataclass)
+    - [3.7 `connection.py` — Per-Peer Connection State](#37-connectionpy--per-peer-connection-state)
+      - [Free Functions](#free-functions-2)
+    - [3.8 `peer_book.py` — SQLite Peer Directory](#38-peer_bookpy--sqlite-peer-directory)
+      - [Database Schema](#database-schema)
+      - [Class: `PeerBook`](#class-peerbook)
+    - [3.9 `file_registry.py` — Decentralised File Registry](#39-file_registrypy--decentralised-file-registry)
+      - [Database Schema](#database-schema-1)
+      - [Class: `FileRegistry`](#class-fileregistry)
+    - [3.10 `storage.py` — Disk Storage \& Quota Manager](#310-storagepy--disk-storage--quota-manager)
+      - [Class: `StorageManager`](#class-storagemanager)
+      - [Metadata file](#metadata-file)
+    - [3.11 `replication.py` — Rebalancing \& Diversity Logic](#311-replicationpy--rebalancing--diversity-logic)
+      - [Class: `ReplicationManager`](#class-replicationmanager)
+    - [3.12 `tui.py` — Terminal UI](#312-tuipy--terminal-ui)
+      - [Class: `TUI`](#class-tui)
+      - [TUI Input Key Bindings](#tui-input-key-bindings)
+    - [3.13 `web/__init__.py` — Flask App Factory](#313-web__init__py--flask-app-factory)
+      - [Function: `create_app(node: App, web_port: int, web_host: str)`](#function-create_appnode-app-web_port-int-web_host-str)
+    - [3.14 `web/routes.py` — HTTP Routes](#314-webroutespy--http-routes)
+      - [Blueprint: `main`](#blueprint-main)
+      - [Auth decorator](#auth-decorator)
+    - [3.15 `web/ws.py` — WebSocket Handler](#315-webwspy--websocket-handler)
+      - [WebSocket endpoint: `/ws`](#websocket-endpoint-ws)
+      - [Implementation notes:](#implementation-notes)
+    - [3.16 `web/templates/index.html` — Main UI](#316-webtemplatesindexhtml--main-ui)
+    - [3.17 `web/templates/login.html` — Login Page](#317-webtemplatesloginhtml--login-page)
+    - [3.18 `web/static/style.css` — Dark Mode Styles](#318-webstaticstylecss--dark-mode-styles)
+    - [3.19 `web/static/app.js` — Frontend Logic](#319-webstaticappjs--frontend-logic)
+      - [Global State](#global-state)
+      - [Functions](#functions)
+      - [Event Listeners](#event-listeners)
+      - [WebSocket Reconnection](#websocket-reconnection)
+    - [3.20 `app.py` — Main Entry Point](#320-apppy--main-entry-point)
+      - [Class: `App`](#class-app)
+      - [CLI Argument Parsing (argparse)](#cli-argument-parsing-argparse)
+      - [`EventBus` class (simple pub/sub)](#eventbus-class-simple-pubsub)
+      - [`main()` function](#main-function)
+  - [4. Data Flow Diagrams](#4-data-flow-diagrams)
+    - [4.1 Message Reception Flow](#41-message-reception-flow)
+    - [4.2 File Download Flow](#42-file-download-flow)
+    - [4.3 File Publish Flow](#43-file-publish-flow)
+    - [4.4 Reconnection Sequence Flow](#44-reconnection-sequence-flow)
+  - [5. Startup \& Reconnection Sequence](#5-startup--reconnection-sequence)
+  - [6. File Lifecycle](#6-file-lifecycle)
+    - [State Machine](#state-machine)
+    - [Replica States (Local Storage)](#replica-states-local-storage)
+  - [7. Error Handling Strategy](#7-error-handling-strategy)
+  - [Appendix A: Bootstrap Peer Configuration](#appendix-a-bootstrap-peer-configuration)
+  - [Appendix B: Constants Summary](#appendix-b-constants-summary)
+  - [Appendix C: Connection URL Format](#appendix-c-connection-url-format)
+  - [Appendix D: Threading Model](#appendix-d-threading-model)
 
 ---
 
@@ -58,20 +115,22 @@ Decenterlised-Web/
 │   └── static/
 │       ├── style.css         # Dark mode CSS
 │       ├── app.js            # Frontend JS: auth, WS, DOM
-│       └── qrcode.min.js     # QR code library
+│       ├── qrcode.min.js     # QR code generation library
+│       └── jsqr.min.js       # QR code scanning library
 └── requirements.txt          # flask, flask-sock, cryptography, rich
 ```
 
 **Data directory** (`~/.decentralised-web/`):
 ```
 ~/.decentralised-web/
+├── config.json               # User settings (network name, storage quota, etc.)
 ├── node_identity.json        # Random Ed25519 keypair (Node ID)
 ├── peers.db                  # SQLite peer book
 ├── registry.db               # SQLite file registry
 └── files/
     ├── <fileId1>             # Stored file (flat binary)
     ├── <fileId2>
-    └── ...
+    └── .metadata.json        # Own/replica/temporary file tracking
 ```
 
 ---
@@ -275,8 +334,8 @@ Per-`udp_engine` singleton. Manages sequence numbers per peer-pair and pending A
 | `track_pending(peer_id: str, seq_num: int, payload: bytes, msg_type: int, critical: bool)` | `(str, int, bytes, int, bool) -> None` | `peer_id`, `seq_num`, `payload`, `msg_type`, `critical` (if True, requires ACK) | — | If critical: store in `pending_acks` with retry count 0, expiry = now + 500ms. |
 | `ack_received(peer_id: str, seq_num: int)` | `(str, int) -> None` | `peer_id`, `seq_num` | — | Remove from `pending_acks`. |
 | `get_expired()` | `() -> list[PendingMessage]` | — | List of messages whose ACK timer expired | Iterate `pending_acks`, return those past expiry. Increment retry count. If retries ≥ 5, call `on_retry_failed`. |
-| `needs_ack(msg_type: int)` | `(int) -> bool` | Message type ID | `True` if message requires ACK | Returns True for: `file_chunk` (0x31), `file_registry_query` (0x20), `file_registry_response` (0x21), `file_registry_push` (0x22), `file_publish` (0x50), `file_update` (0x51), `file_delete` (0x52). |
-| `build_ack(peer_id: str, ack_seq: int)` | `(str, int) -> bytes` | `peer_id`, the seq_num being acknowledged | Encoded `ack` message payload | Simple: `[2B ack_msg_type][4B ack_seq_num]`. ACK message type = 0x03. |
+| `needs_ack(msg_type: int)` | `(int) -> bool` | Message type ID | `True` if message requires ACK | Returns True for: `file_chunk` (0x31), `file_registry_query` (0x20), `file_registry_response` (0x21), `file_registry_push` (0x22), `file_publish` (0x50), `file_update` (0x51), `file_delete` (0x52), `share_file_query` (0x70), `share_file_response` (0x71). |
+| `build_ack(peer_id: str, acked_msg_type: int, ack_seq: int)` | `(str, int, int) -> bytes` | `peer_id`, the original message type being ACK'd, the seq_num being acknowledged | Encoded `ack` message payload | `[2B acked_msg_type][4B ack_seq_num]`. ACK wrapper message type = 0x03. |
 
 #### `PendingMessage` dataclass
 
@@ -322,6 +381,8 @@ class MsgType:
     CONNECT_REQUEST     = 0x0060
     CONNECT_INTRODUCE   = 0x0061
     CONNECT_ACK         = 0x0062
+    SHARE_FILE_QUERY    = 0x0070
+    SHARE_FILE_RESPONSE = 0x0071
     GOODBYE             = 0x00FF
 ```
 
@@ -335,6 +396,7 @@ class HelloPayload:
     public_ip: str        # "203.0.113.5"
     public_port: int      # uint16
     uptime_since: float   # unix timestamp (float64)
+    signature: bytes      # 64 bytes — signs all fields above with node's private key
 
 @dataclass
 class PingPayload:
@@ -342,6 +404,7 @@ class PingPayload:
 
 @dataclass
 class AckPayload:
+    acked_msg_type: int    # uint16 — the original message type being ACK'd
     ack_seq_num: int
 
 @dataclass
@@ -359,6 +422,12 @@ class PeerListRequestPayload:
 class PeerListResponsePayload:
     peers: list[PeerEntry]
     estimated_network_target: int
+    signature: bytes      # 64 bytes — signs the serialised payload with node's private key
+
+@dataclass
+class ReplicaEntry:
+    node_id: str          # 16-char hex
+    added_at: float       # unix timestamp when replica was added
 
 @dataclass
 class FileRegistryEntry:
@@ -370,7 +439,7 @@ class FileRegistryEntry:
     author_public_key: bytes  # 32 bytes
     replica_count: int
     author_signature: bytes   # 64 bytes
-    replicas: list[str]   # list of node_ids
+    replicas: list[ReplicaEntry]
     timestamp: float      # unix timestamp
     previous_file_id: str # empty if original
 
@@ -407,6 +476,8 @@ class FileChunkAckPayload:
 class FileAnnouncePayload:
     file_id: str
     node_id: str
+    is_temporary: bool = False  # True if this is a temporary replica (user opened/downloaded)
+    signature: bytes = b""      # 64 bytes — signs (file_id, node_id, is_temporary) with node's private key
 
 @dataclass
 class ReplicationSolicitPayload:
@@ -465,6 +536,7 @@ class ConnectIntroducePayload:
     requester_node_id: str    # A's node_id
     requester_ip: str
     requester_port: int
+    is_initiator: bool        # True if the receiving peer (C) should fire first (A's NAT is symmetric)
 
 @dataclass
 class ConnectAckPayload:
@@ -473,6 +545,16 @@ class ConnectAckPayload:
 @dataclass
 class GoodbyePayload:
     node_id: str
+
+@dataclass
+class ShareFileQueryPayload:
+    file_id: str
+
+@dataclass
+class ShareFileResponsePayload:
+    file_id: str
+    file_hash: str        # SHA-256 hex of file content
+    suggested_peers: list[str]  # up to 3 node_ids with longest uptime
 ```
 
 #### Class: `MessageBuilder`
@@ -490,7 +572,7 @@ Static methods to encode typed payloads into bytes.
 | `file_registry_response(p: FileRegistryResponsePayload)` | `(FileRegistryResponsePayload) -> bytes` | | |
 | `file_registry_push(p: FileRegistryPushPayload)` | `(FileRegistryPushPayload) -> bytes` | | |
 | `file_request(p: FileRequestPayload)` | `(FileRequestPayload) -> bytes` | | |
-| `file_chunk(p: FileChunkPayload)` | `(FileChunkPayload) -> bytes` | | Binary: all fields encoded |
+| `file_chunk(p: FileChunkPayload)` | `(FileChunkPayload) -> bytes` | | Binary: `[4B fileIdLen][fileId bytes][4B chunkIdx][4B totalChunks][4B dataLen][data]`. Note: fileId uses 4B length prefix (not 2B like `add_string`) to match spec wire format. |
 | `file_chunk_ack(p: FileChunkAckPayload)` | `(FileChunkAckPayload) -> bytes` | | |
 | `file_announce(p: FileAnnouncePayload)` | `(FileAnnouncePayload) -> bytes` | | |
 | `replication_solicit(p: ReplicationSolicitPayload)` | `(ReplicationSolicitPayload) -> bytes` | | |
@@ -501,6 +583,8 @@ Static methods to encode typed payloads into bytes.
 | `connect_request(p: ConnectRequestPayload)` | `(ConnectRequestPayload) -> bytes` | | |
 | `connect_introduce(p: ConnectIntroducePayload)` | `(ConnectIntroducePayload) -> bytes` | | |
 | `connect_ack(p: ConnectAckPayload)` | `(ConnectAckPayload) -> bytes` | | |
+| `share_file_query(p: ShareFileQueryPayload)` | `(ShareFileQueryPayload) -> bytes` | | |
+| `share_file_response(p: ShareFileResponsePayload)` | `(ShareFileResponsePayload) -> bytes` | | |
 | `goodbye(p: GoodbyePayload)` | `(GoodbyePayload) -> bytes` | | |
 
 #### Class: `MessageParser`
@@ -529,6 +613,8 @@ Static methods to parse binary payloads into typed objects.
 | `connect_request(data: bytes)` | `(bytes) -> ConnectRequestPayload` | | |
 | `connect_introduce(data: bytes)` | `(bytes) -> ConnectIntroducePayload` | | |
 | `connect_ack(data: bytes)` | `(bytes) -> ConnectAckPayload` | | |
+| `share_file_query(data: bytes)` | `(bytes) -> ShareFileQueryPayload` | | |
+| `share_file_response(data: bytes)` | `(bytes) -> ShareFileResponsePayload` | | |
 | `goodbye(data: bytes)` | `(bytes) -> GoodbyePayload` | | |
 
 #### Class: `ProtocolRouter`
@@ -555,25 +641,27 @@ Central message dispatcher. One instance per node.
 
 | MsgType | Handler | What it does |
 |---|---|---|
-| `HELLO` | `_handle_hello` | Verify signature, add/update peer in peer_book, mark as connected, send own hello back, trigger peer_list_request |
+| `HELLO` | `_handle_hello` | Verify signature, add/update peer in peer_book, mark as connected, send own hello back, trigger `peer_list_request`, then trigger registry hash exchange via `file_registry_query`. |
 | `PING` | `_handle_ping` | Update last_seen, reply with ping |
 | `PEER_LIST_REQUEST` | `_handle_peer_list_request` | Gather connected peers from connection manager → `PeerListResponsePayload` → send |
-| `PEER_LIST_RESPONSE` | `_handle_peer_list_response` | Merge peers into peer_book, store `estimated_network_target` |
+| `PEER_LIST_RESPONSE` | `_handle_peer_list_response` | Verify node signature against sender's public key (from peer_book or hello). Merge peers into peer_book, store `estimated_network_target`. |
 | `FILE_REGISTRY_QUERY` | `_handle_file_registry_query` | Gather all local registry entries → `FileRegistryResponsePayload` → send |
 | `FILE_REGISTRY_RESPONSE` | `_handle_file_registry_response` | Merge entries into local registry (latest timestamp wins), store `estimated_network_target`. Trigger rebalancing check if in startup phase. |
 | `FILE_REGISTRY_PUSH` | `_handle_file_registry_push` | Merge single entry into local registry. Propagate to other connected peers (except sender). |
 | `FILE_REQUEST` | `_handle_file_request` | Check `storage.has_file(file_id)`. If yes, begin chunked send via udp_engine using `file_chunk` messages. |
-| `FILE_CHUNK` | `_handle_file_chunk` | Accumulate chunk. Send `FILE_CHUNK_ACK`. If all chunks received, reassemble, verify SHA-256, store to disk via `storage.store_replica()`. Notify any waiting download promise. |
+| `FILE_CHUNK` | `_handle_file_chunk` | Look up `DownloadState` in `pending_downloads[file_id]` (create if first chunk — set `total_chunks` and initialise `received` dict). Store chunk data in `received[chunk_index]`. Send `FILE_CHUNK_ACK`. Compute `progress = len(received) / total_chunks`, emit `download_progress` event via EventBus. If all chunks received (`len(received) == total_chunks`): reassemble in order, verify SHA-256, store to disk via `storage.store_replica()` or `storage.store_temporary_replica()`, set `download_complete` Event. |
 | `FILE_CHUNK_ACK` | `_handle_file_chunk_ack` | Advance chunk send pointer for the in-progress upload. |
-| `FILE_ANNOUNCE` | `_handle_file_announce` | Increment replica_count in local registry for that file. Propagate via gossip. |
+| `FILE_ANNOUNCE` | `_handle_file_announce` | Verify node signature against sender's known public key. Increment replica_count in local registry for that file. Propagate via gossip. |
 | `REPLICATION_SOLICIT` | `_handle_replication_solicit` | Delegate to `replication.consider_solicit()`. |
 | `REPLICATION_ACK` | `_handle_replication_ack` | Increment replica_count. |
 | `FILE_PUBLISH` | `_handle_file_publish` | Verify author signature. Add to local registry. Gossip. |
 | `FILE_UPDATE` | `_handle_file_update` | Verify author matches original. Update registry entry. |
 | `FILE_DELETE` | `_handle_file_delete` | Verify author matches original. Mark deleted in registry. |
-| `CONNECT_REQUEST` | `_handle_connect_request` | If connected to target_node_id, relay as `CONNECT_INTRODUCE` to target. |
-| `CONNECT_INTRODUCE` | `_handle_connect_introduce` | Initiate mutual hole punch to requester. Send `CONNECT_ACK` back via introducer. |
-| `CONNECT_ACK` | `_handle_connect_ack` | Record that peer-assisted connection is proceeding. |
+| `CONNECT_REQUEST` | `_handle_connect_request` | If connected to `target_node_id`, relay as `CONNECT_INTRODUCE` to target. If NOT connected to target, send a `CONNECT_ACK` back to requester with a failure flag (`peer_node_id` set to empty string — signal that relay is unavailable). Requester treats empty `peer_node_id` as relay failure and removes this relay from consideration. |
+| `CONNECT_INTRODUCE` | `_handle_connect_introduce` | If `is_initiator`: immediately start hole punching to requester (send 3 hello packets). Else: start listening and send hellos after 200ms delay. Send `CONNECT_ACK` back via introducer to confirm receipt. |
+| `CONNECT_ACK` | `_handle_connect_ack` | Signal the pending `threading.Event` for the assisted connection keyed by `peer_node_id`. |
+| `SHARE_FILE_QUERY` | `_handle_share_file_query` | Look up file in registry. Find up to 3 peers hosting it with longest uptime. Build `ShareFileResponsePayload` → send. |
+| `SHARE_FILE_RESPONSE` | `_handle_share_file_response` | Store response in `pending_share_responses[file_id]` and set the associated `threading.Event`. |
 | `GOODBYE` | `_handle_goodbye` | Mark peer as offline in peer_book. Decrement replica counts for files they hosted. |
 
 ---
@@ -620,8 +708,11 @@ STUN_TIMEOUT = 3.0  # seconds
 | `peer_book` | `PeerBook` | Peer directory |
 | `running` | `bool` | Set False to stop the recv loop |
 | `recv_thread` | `threading.Thread` | Background recv loop |
-| `pending_downloads` | `dict[str, asyncio.Future]` | `file_id -> Future[bytes]` for awaiting downloads |
+| `pending_downloads` | `dict[str, DownloadState]` | `file_id -> DownloadState` for in-progress downloads |
+| `pending_assisted` | `dict[str, threading.Event]` | `target_id -> Event` signalled when CONNECT_ACK received |
+| `pending_share_responses` | `dict[str, tuple[threading.Event, ShareFileResponsePayload]]` | `file_id -> (Event, response)` for awaiting share query responses |
 | `upload_queue` | `dict[(str, str), UploadState]` | `(peer_id, file_id) -> UploadState` for chunked sends |
+| `_addr_to_node_id` | `dict[tuple[str, int], str]` | Reverse mapping: `(ip, port) -> node_id` |
 
 | Method | Signature | Input | Output | Description |
 |---|---|---|---|---|
@@ -631,13 +722,15 @@ STUN_TIMEOUT = 3.0  # seconds
 | `_recv_loop()` | `() -> None` | — (runs in thread) | — | Loop: `sock.recvfrom(65535)` → decode via `wire.decode()` → dispatch to `protocol_router.route()`. Catch `WireError`, log. |
 | `send_to(peer_id: str, msg_type: int, payload: bytes, addr: tuple[str, int] = None)` | `(str, int, bytes, tuple?) -> int` | `peer_id`, `msg_type`, `payload`, optional `addr` override | Sequence number used | 1. Get next seq_num from `reliable.next_seq(peer_id)`. 2. Encode via `wire.encode()`. 3. If `addr` is None, look up from `connections[peer_id]`. 4. `sock.sendto(encoded, addr)`. 5. If message needs ACK, `reliable.track_pending()`. |
 | `hole_punch(target_id: str, target_ip: str, target_port: int, target_pubkey: bytes)` | `(str, str, int, bytes) -> bool` | Target's node_id, IP, port, public key | `True` if connection established | 1. Create `ConnectionState` in PUNCHING state. 2. Send 3 `hello` packets at 100ms intervals via `send_to()`. 3. Wait up to 5s for a `hello` response from that peer (tracked via `connections[target_id].hello_received` Event). 4. If received: mark CONNECTED, update peer_book, return True. 5. If timeout: return False. |
-| `peer_assisted_connect(target_id: str, relay_id: str)` | `(str, str) -> bool` | `target_id`: peer to reach; `relay_id`: mutual peer to relay through | `True` if connected | 1. Send `CONNECT_REQUEST` to relay. 2. Wait for `CONNECT_ACK` relayed back (5s timeout). 3. On receipt: start mutual hole punch — send 3 `hello` packets + await incoming. 4. Return result. |
-| `download_file(file_id: str)` | `(str) -> bytes` | `file_id` | File content as bytes | 1. Find a peer hosting this file in registry. 2. Send `FILE_REQUEST` to that peer. 3. Create a `Future` in `pending_downloads[file_id]`. 4. Await the future (chunks arrive via `_handle_file_chunk`). 5. Return reassembled bytes. |
+| `peer_assisted_connect(target_id: str, relay_id: str)` | `(str, str) -> bool` | `target_id`: peer to reach; `relay_id`: mutual peer to relay through | `True` if connected | 1. Create `threading.Event` in `pending_assisted[target_id]`. 2. Loop with backoff delays [1.0, 2.0, 4.0]: send `CONNECT_REQUEST` to relay, wait for Event with timeout = delay + 5s. 3. If Event is set (CONNECT_ACK received): start mutual hole punch — if this node is designated initiator, send 3 `hello` packets first; else wait 200ms then send. 4. Return result. 5. If all 3 retries exhausted, remove Event and return False. |
+| `download_file(file_id: str)` | `(str) -> bytes` | `file_id` | File content as bytes | 1. Find a peer hosting this file in registry. 2. Send `FILE_REQUEST` to that peer. 3. Create a `DownloadState` in `pending_downloads[file_id]`. 4. Wait on `download_complete` Event. 5. Return reassembled bytes. |
 | `upload_file(peer_id: str, file_id: str, data: bytes)` | `(str, str, bytes) -> None` | `peer_id`, `file_id`, raw file bytes | — | 1. Chunk data into 16KB pieces. 2. Create `UploadState` in `upload_queue`. 3. Send first chunk. 4. Chunk ACKs advance the pointer; retransmit on timeout. |
 | `broadcast(msg_type: int, payload: bytes)` | `(int, bytes) -> None` | `msg_type`, `payload` | — | Send to all CONNECTED peers in `connections`. |
 | `broadcast_except(msg_type: int, payload: bytes, exclude_id: str)` | `(int, bytes, str) -> None` | As above + excluded peer_id | — | Send to all except `exclude_id`. |
 | `get_connected_peers()` | `() -> list[str]` | — | List of connected `node_id`s | Filter `connections` for CONNECTED state. |
 | `lan_broadcast()` | `() -> None` | — | — | Send `hello` to `255.255.255.255:port`. |
+| `check_liveness()` | `() -> None` | — | — | Iterate `connections`. For each peer where `!is_alive(conn)`: call `mark_disconnected()`, `peer_book.mark_offline(node_id)`, `file_registry.remove_peer_replicas(node_id)`, `replication.on_peer_disconnected(node_id)`. Emit `peer_disconnected` event. Remove from `connections`. |
+| `resolve_node_id(addr: tuple[str, int])` | `(tuple) -> str | None` | `(ip, port)` | `node_id` or None | Look up in `_addr_to_node_id`. Updated in `_recv_loop` whenever a message arrives. |
 
 #### `ConnectionState` dataclass
 
@@ -647,7 +740,7 @@ class ConnectionState:
     node_id: str
     public_key: bytes
     address: tuple[str, int]      # (ip, port)
-    state: str                    # "PUNCHING" | "CONNECTED" | "ASSISTED"
+    state: str                    # "PUNCHING" | "CONNECTED" | "ASSISTED" | "DISCONNECTED" | "UNREACHABLE"
     hello_received: threading.Event
     last_seen: float
     uptime_since: float           # peer's reported uptime
@@ -667,6 +760,19 @@ class UploadState:
     current_chunk: int
     retries: dict[int, int]       # chunk_index -> retry_count
     last_sent: dict[int, float]
+```
+
+#### `DownloadState` dataclass
+
+```python
+@dataclass
+class DownloadState:
+    file_id: str
+    total_chunks: int              # known after first chunk arrives
+    received: dict[int, bytes]     # chunk_index -> chunk data
+    peer_id: str                   # the peer we're downloading from
+    started_at: float
+    download_complete: threading.Event
 ```
 
 ---
@@ -796,6 +902,8 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 | `verify_author_signature(entry: FileRegistryEntry)` | `(FileRegistryEntry) -> bool` | Entry with signature | `True` if valid | Reconstruct signed payload: `{file_id, file_name, file_size, mime_type, author_id, timestamp}` as deterministic binary → verify against `author_public_key` and `author_signature`. |
 | `total_unique_file_size()` | `() -> int` | — | Sum of all unique file sizes | For `networkTarget` calculation |
 | `count()` | `() -> int` | — | Number of non-deleted files | |
+| `cleanup_old_versions(max_age_seconds: float = 86400)` | `(float) -> int` | `max_age_seconds` (default 24h) | Number removed | Find files where a newer version exists (traced via `previous_file_id` chain) AND the old version's `timestamp < now - max_age_seconds`. Remove entries from registry and return count. The calling code handles disk deletion. | |
+| `get_version_chain(file_id: str)` | `(str) -> list[str]` | Current `file_id` | List of all `file_id`s in the version chain (oldest first) | Follow `previous_file_id` links to build the full chain. |
 
 ---
 
@@ -813,9 +921,12 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 
 | Method | Signature | Input | Output | Description |
 |---|---|---|---|---|
-| `__init__(data_dir: str, total_mb: int)` | `(str, int) -> None` | `data_dir`, `total_mb` | — | Create `files/` dir if needed. |
+| `__init__(data_dir: str, total_mb: int)` | `(str, int) -> None` | `data_dir`, `total_mb` | — | Create `files/` dir if needed. Set `total_configured_mb = total_mb`. Note: if `total_mb` is 0 or unset, use `max(used_for_own_files() / (1024*1024), DEFAULT_STORAGE_MB)` — dynamic default. |
 | `store_own_file(file_id: str, data: bytes, file_name: str, mime_type: str)` | `(str, bytes, str, str) -> str` | `file_id`, raw bytes, name, MIME type | Absolute file path | Write to `files/<file_id>`. Track in metadata. |
 | `store_replica(file_id: str, data: bytes)` | `(str, bytes) -> str` | `file_id`, raw bytes | File path | Write to `files/<file_id>`. Mark as replica (not own). |
+| `store_temporary_replica(file_id: str, data: bytes, tab_id: str)` | `(str, bytes, str) -> str` | `file_id`, raw bytes, tab identifier | File path | Write to `files/<file_id>`. Add to `temporary_files` in metadata with `expires_at = now + 3600` (1h timeout) and `tab_id`. |
+| `promote_temporary(file_id: str)` | `(str) -> None` | `file_id` | — | Remove from `temporary_files`, add to `replica_files`. Called when tab closes or timeout elapses. |
+| `cleanup_expired_temporary()` | `() -> list[str]` | — | List of file_ids promoted | Find all temporary files where `expires_at < now`. Call `promote_temporary()` for each. After promotion, trigger `replication.execute_rebalance()`. Return promoted file_ids. |
 | `has_file(file_id: str)` | `(str) -> bool` | `file_id` | `True` if file exists on disk | |
 | `read_file(file_id: str)` | `(str) -> bytes` | `file_id` | File content | Read from `files/<file_id>`. Raise `FileNotFoundError` if missing. |
 | `delete_file(file_id: str)` | `(str) -> bool` | `file_id` | `True` if deleted | Remove from disk. Return False if file didn't exist. |
@@ -858,21 +969,24 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 | `rebalance_gate` | `bool` | `True` when rebalancing is allowed (post-reconnection assessment) |
 | `estimated_network_target` | `int` | Merged from gossip (median of received estimates) |
 | `received_targets` | `list[int]` | Collected `estimated_network_target` values from peers |
+| `tier1_contacted` | `set[str]` | Set of Tier 1 node_ids that have been contacted (regardless of success) |
+| `tier1_total` | `int` | Total number of Tier 1 peers known at startup |
 
 | Method | Signature | Input | Output | Description |
 |---|---|---|---|---|
 | `calculate_network_target()` | `() -> int` | — | Computed target | `floor(Σ storage_of_all_known_peers / Σ unique_file_size)`. Uses cached values from registry. |
 | `receive_target_estimate(value: int)` | `(int) -> None` | Estimate from a peer | — | Append to `received_targets`. Recalculate median → `estimated_network_target`. |
 | `open_gate()` | `() -> None` | — | — | Set `rebalance_gate = True`. Called after startup Phase 2 completes. |
-| `should_rebalance()` | `() -> bool` | — | `True` if gate open AND connected peers ≥ 3 | |
+| `should_rebalance()` | `() -> bool` | — | `True` if gate open AND (connected peers ≥ 3 OR all Tier 1 peers contacted) | |
 | `get_under_replicated()` | `() -> list[FileRegistryEntry]` | — | Files where `replica_count < networkTarget - 1` | |
 | `get_over_replicated()` | `() -> list[FileRegistryEntry]` | — | Files where `replica_count > networkTarget + 1`, limited to locally stored files | |
 | `get_at_target_low()` | `() -> list[FileRegistryEntry]` | — | Files at `replica_count == networkTarget - 1` | Bottom edge of tolerance band |
 | `get_at_target_high()` | `() -> list[FileRegistryEntry]` | — | Files at `replica_count == networkTarget + 1`, locally stored | Top edge of tolerance band |
+| `get_at_target_exact()` | `() -> list[FileRegistryEntry]` | — | Files at `replica_count == networkTarget`, locally stored, not own files | Exact target — last resort for deletion to make room for under-replicated files |
 | `diversity_score(file_id: str)` | `(str) -> float` | `file_id` | Score 0.0–1.0 | 1. Get set of node_ids hosting this file. 2. Get set of node_ids this node is connected to. 3. `score = 1.0 - (|intersection| / |existing_replicas|)`. Higher score = less overlap = more diverse. |
 | `rank_by_diversity(candidates: list[FileRegistryEntry])` | `(list[FileRegistryEntry]) -> list[FileRegistryEntry]` | Candidate files | Sorted list (highest diversity first) | Compute diversity score for each, sort descending. |
 | `select_files_to_replicate(limit_bytes: int)` | `(int) -> list[str]` | Available bytes | List of file_ids to replicate | 1. Get under-replicated files. 2. Rank by diversity. 3. Greedily select until total size ≤ limit_bytes. 4. If space remains, consider `get_at_target_low()`. |
-| `select_files_to_delete(needed_bytes: int)` | `(int) -> list[str]` | Bytes needed to free | List of file_ids to delete | 1. Get over-replicated files (locally stored). 2. Sort by highest replica_count first (most over-replicated). 3. Greedily select until total size ≥ needed_bytes. 4. If still not enough, consider `get_at_target_high()`. 5. Never select own published files. 6. Never select files where this node is the only replica holder. |
+| `select_files_to_delete(needed_bytes: int)` | `(int) -> list[str]` | Bytes needed to free | List of file_ids to delete | 1. Get over-replicated files (locally stored). 2. Sort by highest replica_count first (most over-replicated). 3. Greedily select until total size ≥ needed_bytes. 4. If still not enough, consider `get_at_target_high()`. 5. If still not enough, consider `get_at_target_exact()` (only if an under-replicated file is critically vulnerable: `replica_count <= max(1, floor(networkTarget / 2))`). 6. Never select own published files. 7. Never select files where this node is the only replica holder. |
 | `execute_rebalance()` | `() -> None` | — | — | 1. If `!should_rebalance()` → return. 2. Compute `available = storage.available_bytes()`. 3. If any file is under-replicated and `available > 0`: select & replicate. 4. If storage is full and under-replicated files exist: `select_files_to_delete()`, delete, then replicate. 5. If over-replicated files exist and no under-replicated files: consider deleting to free space. |
 | `solicit_replication(file_id: str)` | `(str) -> None` | `file_id` | — | Build `ReplicationSolicitPayload`, broadcast to connected peers. |
 | `consider_solicit(payload: ReplicationSolicitPayload)` | `(ReplicationSolicitPayload) -> bool` | Solicitation | `True` if accepting | 1. Check if file already stored locally → return False. 2. Check if space available. 3. If yes: request file via `udp_engine.download_file()`, store, send `REPLICATION_ACK`. |
@@ -901,6 +1015,8 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 | `render_peer_table()` | `() -> Table` | Rich Table with columns: Node ID (truncated), Username, Status (🟢/🟡/🔴), Uptime, Address |
 | `render_file_table()` | `() -> Table` | Rich Table with columns: Icon, File Name, Size, Replicas, Author, Actions. Filtered by search string. |
 | `render_my_files_table()` | `() -> Table` | As above, filtered to files authored by logged-in user. Extra actions: [u]pdate, [x]delete. |
+| `render_storage_tab()` | `() -> Table` | Rich Table with columns: File ID (truncated), Type (Own/Replica/Temporary), Size, Status. Shows all locally stored files with their category. |
+| `render_peer_book_tab()` | `() -> Table` | Rich Table with columns: Node ID, Tier, Last Seen, Address, Status. Paginated list of all known peers from `peer_book.get_all_ordered()`. |
 | `render_status_bar()` | `() -> Panel` | Storage bar + health indicator + peer/file counts |
 | `handle_key(key: str)` | `(str) -> None` | Dispatch keyboard input |
 | `do_search(char: str)` | `(str) -> None` | Append to search string, filter file list |
@@ -910,6 +1026,7 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 | `do_login()` | `() -> None` | Prompt for username + password → `node.login()` |
 | `do_update(file_id: str)` | `(str) -> None` | Prompt for new file → `node.update_file()` |
 | `do_delete(file_id: str)` | `(str) -> None` | Confirm → `node.delete_file()` |
+| `do_replicate(file_id: str)` | `(str) -> None` | Trigger replication for selected file via `node.replication.solicit_replication(file_id)`. |
 | `switch_tab(tab: int)` | `(int) -> None` | Switch between [1] Network Files, [2] My Files, [3] Storage, [4] Peers |
 
 #### TUI Input Key Bindings
@@ -961,14 +1078,17 @@ CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
 | `/api/files/<file_id>` | GET | Required | Get single file entry |
 | `/api/files/<file_id>/download` | GET | Required | Download file: `node.open_file(file_id)` → serve with appropriate Content-Type and Content-Disposition |
 | `/api/files/<file_id>/open` | GET | Required | Open file (same as download but with inline Content-Disposition) |
-| `/api/files/upload` | POST | Required | Accept multipart file upload. Read file → `node.publish_file(file_name, data, mime_type)` → return `{ "file_id": "..." }` |
+| `/api/files/upload` | POST | Required | Accept multipart file upload. Read file data, determine MIME type → `node.publish_file(data, file_name, mime_type)` → return `{ "file_id": "..." }` |
 | `/api/files/<file_id>/update` | POST | Required | Accept multipart file upload. `node.update_file(file_id, new_data)` → return `{ "file_id": "..." }` |
 | `/api/files/<file_id>/delete` | DELETE | Required | `node.delete_file(file_id)` → return `{ "success": true }` |
+| `/api/files/<file_id>/close` | POST | Required | `storage.promote_temporary(file_id)`. Return `{ "success": true }`. |
 | `/api/peers` | GET | Required | Return list of known peers with status |
 | `/api/peers/connect` | POST | Required | Accept `{ "url": "connection URL" }`. Parse URL → `node.connect_to_peer(id, pk, ip, port)`. Return `{ "success": true }` |
+| `/api/network-name` | GET | Required | Return `{ "name": str }` from config file (default: auto-generated). |
+| `/api/network-name` | POST | Required | Accept `{ "name": str }`. Save to `config.json`. Return `{ "success": true }`. |
 | `/api/qr` | GET | Required | Return `{ "url": "<connection URL>" }` for this node's QR code |
 | `/api/storage/config` | GET | Required | Return `{ "total_mb": int, "used_own": int, "used_replicas": int, "available": int }` |
-| `/api/storage/config` | POST | Required | Accept `{ "total_mb": int }`. Update quota. |
+| `/api/storage/config` | POST | Required | Accept `{ "total_mb": int }`. Validate: if `total_mb * 1024 * 1024 < used_for_own_files()`, return 400 with `{ "error": "Quota too low", "min_required_mb": ceil(used_for_own_files() / 1024 / 1024) }`. Else update quota. |
 | `/api/share/<file_id>` | GET | Required | Generate share URL: `node.create_share_link(file_id)` → return `{ "url": "...", "qr_url": "..." }` |
 
 #### Auth decorator
@@ -1006,11 +1126,13 @@ def login_required(f):
 | `share` | `{ "file_id": str }` | Generate share link, send back as `share_response` |
 | `connect_peer` | `{ "url": str }` | Parse and connect to peer |
 | `publish` | `{ "file_name": str }` | (Not the binary — binary goes via HTTP POST. This just notifies of intent.) |
+| `tab_closed` | `{ "file_id": str }` | Notify server that the opened tab was closed. Server calls `storage.promote_temporary(file_id)` and triggers rebalancing. |
 
 #### Implementation notes:
 - WebSocket connection is established after successful login.
 - Server holds a set of connected WebSocket clients and broadcasts to all on state changes.
 - The `node` object has an `event_bus` (simple pub/sub) that the WebSocket handler subscribes to.
+- **Health debouncing**: `health_update` events are debounced — a pending health state must persist for 5 seconds before being broadcast. A debounce timer in the WebSocket handler tracks the pending state; if the state changes again within 5s, the timer resets. This prevents brief disconnect/reconnect cycles from causing UI flicker.
 
 ---
 
@@ -1021,9 +1143,10 @@ Full HTML structure for the authenticated UI. Jinja2 template.
 **Sections**:
 1. **Title bar**: Network name, author username, [Share Network] button, Node ID, [Logout]
 2. **Left panel** (collapsible): QR code, copy link, paste peer address, scan QR, hide panel
-3. **Center panel — Tabs**: [My Files] [Browse] with search box and [+ Upload]
+3. **Center panel — Tabs**: [My Files] [Browse] with search box and [+ Upload]. [Settings] tab for storage quota configuration.
 4. **File rows**: Collapsed (icon, name, type, size, replicas, expand arrow), Expanded (author, peers, [Open] [Download] [Share/Update/Delete])
 5. **Bottom bar**: Storage progress bar, health indicator
+6. **Settings tab**: Storage quota slider/input with fair contribution warning if quota < own files size. Network name field.
 
 Requires: `style.css`, `app.js`, `qrcode.min.js`, WebSocket.
 
@@ -1134,6 +1257,8 @@ const state = {
 | `logout()` | POST `/api/logout` → redirect to `/login`. |
 | `showQRModal(url)` | Create modal overlay with QR code canvas (using `qrcode.min.js`) and copy button. |
 | `onFileRowClick(fileId)` | Toggle expand. If already expanded, collapse. |
+| `setStorageQuota(mb)` | POST `/api/storage/config` with `{ total_mb: mb }`. On 400, show warning: "Cannot set quota below your own files size (X MB)." On success, refresh storage. |
+| `showSettingsTab()` | Render the Settings tab: quota input, fair contribution warning, network name field. |
 
 #### Event Listeners
 
@@ -1146,6 +1271,7 @@ const state = {
 - [📎 Paste Peer] click → `pastePeerAddress()`
 - [📷 Scan Peer] click → `scanQR()`
 - [Logout] click → `logout()`
+- `beforeunload` / `pagehide` events → send `tab_closed` WebSocket message for any open files
 
 #### WebSocket Reconnection
 
@@ -1166,6 +1292,8 @@ The central orchestrator. All modules reference each other through this.
 | `data_dir` | `str` | `~/.decentralised-web` |
 | `node_identity` | `NodeIdentity` | This node's random identity |
 | `author_identity` | `AuthorIdentity | None` | Logged-in author (None if not logged in) |
+| `author_mode` | `str` | `"full"` or `"browse_only"` — set during login based on remote login rules |
+| `MIN_PUBLISH_BYTES` | `int` (class constant) | `1048576` (1MB) — minimum free storage required on a remote node to allow publishing by a new author |
 | `udp_engine` | `UDPEngine` | Network layer |
 | `protocol_router` | `ProtocolRouter` | Message dispatcher |
 | `reliable` | `ReliabilityManager` | ACK/retransmit |
@@ -1179,16 +1307,17 @@ The central orchestrator. All modules reference each other through this.
 
 | Method | Signature | Input | Output | Description |
 |---|---|---|---|---|
-| `__init__(args: argparse.Namespace)` | `(Namespace) -> None` | Parsed CLI args | — | 1. Resolve `data_dir`. 2. Load/create `NodeIdentity`. 3. Derive `AuthorIdentity` if credentials provided. 4. Initialise all modules in dependency order. 5. Wire cross-references. 6. Register all protocol handlers. |
+| `__init__(args: argparse.Namespace)` | `(Namespace) -> None` | Parsed CLI args | — | 1. Resolve `data_dir`. 2. Apply `tui_port_offset` to `port` and `web_port`. 3. Load/create `NodeIdentity`. 4. Derive `AuthorIdentity` if credentials provided. 5. Initialise all modules in dependency order. 6. Wire cross-references. 7. Register all protocol handlers. |
 | `start()` | `() -> None` | — | — | 1. Start UDP engine. 2. Run startup/reconnection sequence (§9b). 3. If `--no-tui` is false, launch TUI. 4. If `--web-port > 0`, launch Flask in a thread. 5. Enter main event loop. |
 | `stop()` | `() -> None` | — | — | Graceful shutdown: stop UDP engine, stop Flask, close DBs. |
-| `login(username: str, password: str)` | `(str, str) -> AuthorIdentity` | Credentials | Author identity | Derive `AuthorIdentity`. Store in `self.author_identity`. Return it. |
+| `login(username: str, password: str)` | `(str, str) -> AuthorIdentity` | Credentials | Author identity | 1. Derive `AuthorIdentity`. 2. Store in `self.author_identity`. 3. Check remote login policy: (a) if author has existing files in local registry → this is a "home" or "returning" login; (b) if no local files, check `file_registry.get_by_author(author_id)` — if any exist AND at least one peer hosting those files is currently connected (intersect with `udp_engine.get_connected_peers()`), author has contributed and is online; (c) if author has never published OR no previous node is online → check `storage.available_bytes() >= MIN_PUBLISH_BYTES`, if yes allow publishing (remote node hosts), else set `self.author_mode = "browse_only"`. 4. Return identity. |
+| `author_can_publish()` | `() -> bool` | — | `True` if author can publish new files | Returns False only if `author_mode == "browse_only"`. Publishers on remote nodes are allowed if author has contributed before OR the remote node has spare storage to host a file. |
 | `publish_file(file_path_or_data, file_name, mime_type)` | `(str|bytes, str, str) -> str` | File path or raw bytes, name, MIME type | `file_id` | 1. Read file data. 2. Generate `file_id = SHA-256(data + author_id + timestamp)`. 3. Store on disk. 4. Sign with author key. 5. Build `file_publish` → broadcast. 6. Add to local registry. 7. Emit `file_update` event. |
 | `download_file(file_id: str)` | `(str) -> bytes` | `file_id` | File content | Delegate to `udp_engine.download_file()`. On success: store replica, announce, emit event. |
 | `open_file(file_id: str)` | `(str) -> bytes` | `file_id` | File content | Same as download but with different event emission for UI tracking. |
 | `update_file(file_id: str, new_data: bytes)` | `(str, bytes) -> str` | Existing file_id, new file data | New `file_id` | 1. Verify author matches. 2. Generate new file_id. 3. Build `file_update` → broadcast. 4. Update registry. |
 | `delete_file(file_id: str)` | `(str) -> None` | `file_id` | — | 1. Verify author matches. 2. Build `file_delete` → broadcast. 3. Mark deleted in registry. 4. Delete from disk. |
-| `create_share_link(file_id: str)` | `(str) -> str` | `file_id` | Share URL | Generate URL with node info + file hash + up to 3 peers (longest uptime). |
+| `create_share_link(file_id: str)` | `(str) -> str` | `file_id` | Share URL | 1. Send `SHARE_FILE_QUERY` to a connected peer. 2. Receive `SHARE_FILE_RESPONSE` with `suggested_peers` (node_ids). 3. For each node_id, resolve address via `peer_book.get(node_id)`. 4. Generate URL with node info + file hash + up to 3 peers (longest uptime, now resolved to ip:port). |
 | `connect_to_peer(node_id: str, pubkey_b64: str, ip: str, port: int)` | `(str, str, str, int) -> bool` | Peer details | Success | Delegate to `udp_engine.hole_punch()`. |
 | `connect_via_url(url: str)` | `(str) -> bool` | Connection URL | Success | Parse URL parameters → `connect_to_peer()`. |
 
@@ -1197,7 +1326,7 @@ The central orchestrator. All modules reference each other through this.
 ```python
 parser = argparse.ArgumentParser(description="Decentralised File Storage Network")
 parser.add_argument('--user', '-u', default=os.environ.get('DECWEB_USER'), help='Author username')
-parser.add_argument('--pass', '-p', default=os.environ.get('DECWEB_PASS'), help='Author password')
+parser.add_argument('--pass', '-p', dest='password', default=os.environ.get('DECWEB_PASS'), help='Author password')
 parser.add_argument('--port', '-P', type=int, default=9000, help='UDP listen port')
 parser.add_argument('--no-tui', action='store_true', help='Disable terminal UI')
 parser.add_argument('--web-port', type=int, default=9001, help='Web UI port (0 = disable)')
@@ -1205,6 +1334,7 @@ parser.add_argument('--web-host', default='127.0.0.1', help='Web UI bind address
 parser.add_argument('--data-dir', default=os.path.expanduser('~/.decentralised-web'), help='Data directory')
 parser.add_argument('--storage-limit', type=int, default=500, help='Max storage in MB for replicas')
 parser.add_argument('--no-lan', action='store_true', help='Disable LAN broadcast discovery')
+parser.add_argument('--tui-port-offset', type=int, default=0, help='Offset added to all ports for multi-instance testing')
 ```
 
 #### `EventBus` class (simple pub/sub)
@@ -1231,7 +1361,7 @@ Events emitted: `peer_connected`, `peer_disconnected`, `file_added`, `file_updat
 
 ```python
 def main():
-    args = parse_args()
+    args = parser.parse_args()
     app = App(args)
     try:
         app.start()
@@ -1291,19 +1421,19 @@ UDPEngine.download_file("abc123")
     │
     ├── Send FILE_REQUEST to "d4e5f6"
     │
-    └── Create pending_downloads["abc123"] = Future
+    └── Create pending_downloads["abc123"] = DownloadState
         │
         ▼ (chunks arrive asynchronously)
     _handle_file_chunk()
         │
         ├── Send FILE_CHUNK_ACK
-        ├── Accumulate chunk data
+        ├── Store chunk in DownloadState.received[chunk_index]
         └── If all chunks received:
             ├── Reassemble → verify SHA-256
-            ├── Storage.store_replica(file_id, data)
-            ├── Resolve pending_downloads["abc123"] future
+            ├── Storage.store_temporary_replica(file_id, data, tab_id)
+            ├── Set DownloadState.download_complete Event
             ├── FileRegistry.increment_replica("abc123", own_node_id)
-            ├── Broadcast FILE_ANNOUNCE
+            ├── Broadcast FILE_ANNOUNCE (is_temporary=True)
             └── Emit event → WebSocket → browser
                 │
                 ▼
@@ -1365,7 +1495,17 @@ App.start()
     │   └── Send PEER_LIST_REQUEST to connected peers
     │       └── On PEER_LIST_RESPONSE → merge into peer_book
     │
-    └── Phase 5: UDPEngine.lan_broadcast() (unless --no-lan)
+    ├── Phase 5: UDPEngine.lan_broadcast() (unless --no-lan)
+    │
+    ├── Phase 6: Start all periodic tasks (full list in §5 step 8):
+    │   ├── keepalive_ping (every 30s)
+    │   ├── retransmit_check (every 100ms)
+    │   ├── rebalance_periodic (every 60s)
+    │   ├── liveness_check (every 30s)
+    │   ├── temporary_replica_cleanup (every 300s)
+    │   ├── old_version_gc (every 1800s)
+    │   ├── lan_broadcast_periodic (every 30s)
+    │   └── peer_book_cleanup (every 3600s)
 ```
 
 ---
@@ -1391,6 +1531,8 @@ Detailed as pseudocode in `App.start()`:
 7. RECONNECTION:
    a. peers = peer_book.get_all_ordered()
    b. if not peers: peers = BOOTSTRAP_PEERS  # hardcoded
+      # Also use bootstrap peers if all tier connection attempts fail
+      # (tracked via a flag set if Phase 1/4 yield no connections)
    c. PHASE 1: parallel hole punch to Tier 1 peers
    d. wait for at least 1 connection or all attempts exhausted
    e. PHASE 2: FILE_REGISTRY_QUERY to all connected
@@ -1402,9 +1544,14 @@ Detailed as pseudocode in `App.start()`:
 8. START periodic tasks:
    a. keepalive_ping() every 30s
    b. retransmit_check() every 100ms (reliable.get_expired())
-   c. rebalance_periodic() every 60s (replication.execute_rebalance())
+   c. rebalance_periodic() every 60s:
+      1. replication.calculate_network_target() — compute own estimate
+      2. replication.execute_rebalance() — evaluate and act
    d. lan_broadcast_periodic() every 30s if < 2 connected peers
    e. peer_book_cleanup() every 3600s
+   f. liveness_check() every 30s (check for dead peers, trigger disconnect cleanup)
+   g. temporary_replica_cleanup() every 300s (promote expired temporary replicas)
+   h. old_version_gc() every 1800s (remove old file versions)
 9. LAUNCH UI:
    a. if not --no-tui: TUI.run()
    b. if --web-port > 0: Flask in thread
@@ -1521,6 +1668,7 @@ BOOTSTRAP_PEERS = [
 | `DEFAULT_PORT` | `9000` | `app.py` |
 | `DEFAULT_WEB_PORT` | `9001` | `app.py` |
 | `DEFAULT_STORAGE_MB` | `500` | `storage.py` |
+| `MIN_PUBLISH_BYTES` | `1048576` (1MB) | `app.py` |
 | `REBALANCE_INTERVAL` | `60.0` (60s) | `replication.py` |
 | `PEER_BOOK_CLEANUP_DAYS` | `30` | `peer_book.py` |
 | `MAX_CONCURRENT_HOLE_PUNCH` | `10` | `udp_engine.py` |
@@ -1532,14 +1680,24 @@ BOOTSTRAP_PEERS = [
 
 ## Appendix C: Connection URL Format
 
+Connection URLs encode enough information for a peer to initiate a UDP hole punch to another peer. The `<bootstrapper>` part is the HTTP address of any known node's web UI — it is the entry point a browser visits to display the join page.
+
+**Format:**
 ```
-https://<bootstrapper>/?join=<nodeId>&pk=<base64PublicKey>&addr=<publicIP>:<publicPort>
+https://<any-known-peer-ip>:<web-port>/?join=<nodeId>&pk=<base64PublicKey>&addr=<publicIP>:<publicPort>
 ```
 
-- `bootstrapper`: any known HTTP endpoint (e.g. `decentralised.local` or a raw IP)
-- `nodeId`: 16-char hex node ID
-- `pk`: Base64-encoded 32-byte Ed25519 public key (no padding, URL-safe)
-- `addr`: `ip:port` of the peer
+- `<any-known-peer-ip>:<web-port>`: The web UI address of any peer in the network (e.g., `192.168.1.5:9001`). This is just where the browser loads the page from — it does NOT need to be the peer being joined. The actual P2P connection target is in the `addr` parameter. Note: in development, Flask uses HTTP (`http://`) since SSL is not configured; the scheme adapts to the deployment environment.
+- `nodeId`: 16-char hex node ID of the peer to connect to
+- `pk`: Base64-encoded 32-byte Ed25519 public key of the peer (no padding, URL-safe)
+- `addr`: `ip:port` of the peer — this is the actual UDP hole-punch target
+
+**How it works:**
+1. Alice generates her connection URL (with her own `nodeId`, `pk`, and `addr`)
+2. Alice encodes it as a QR code or sends the URL to Bob
+3. Bob's browser loads the URL → his local Python backend parses the parameters → initiates UDP hole punch to `addr`
+4. The `<bootstrapper>` host is just the HTTP entry point — any online peer can serve this role
+5. For QR codes shown in the web UI, `<bootstrapper>` is the local node's own web address
 
 Share link extension:
 ```
@@ -1566,6 +1724,18 @@ Main Thread:
 │
 ├── Rebalance Timer Thread: every 60s
 │   └── replication.execute_rebalance()
+│
+├── Liveness Check Timer Thread: every 30s
+│   └── udp_engine.check_liveness()
+│
+├── Temporary Replica Cleanup Timer: every 300s
+│   └── storage.cleanup_expired_temporary()
+│
+├── Old Version GC Timer: every 1800s
+│   └── file_registry.cleanup_old_versions()
+│
+├── Peer Book Cleanup Timer: every 3600s
+│   └── peer_book.cleanup()
 │
 ├── LAN Broadcast Timer: every 30s (if < 2 peers)
 │   └── udp_engine.lan_broadcast()

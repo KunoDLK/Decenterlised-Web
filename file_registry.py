@@ -1,0 +1,370 @@
+"""
+file_registry.py — Decentralised File Registry
+
+Local copy of the network-wide file registry, SQLite-backed, gossiped between peers.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Optional, TYPE_CHECKING
+
+from protocol import FileRegistryEntry, ReplicaEntry
+from identity import AuthorIdentity
+
+if TYPE_CHECKING:
+    from storage import StorageManager
+
+# ---------------------------------------------------------------------------
+# FileRegistry
+# ---------------------------------------------------------------------------
+
+
+class FileRegistry:
+    """SQLite-backed file registry with in-memory cache."""
+
+    def __init__(self, data_dir: str, node_id: str) -> None:
+        self.db_path = str(Path(data_dir) / "registry.db")
+        self.node_id = node_id
+        self.entries: dict[str, FileRegistryEntry] = {}
+        self._lock = threading.RLock()
+        self.storage: Optional["StorageManager"] = None
+
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+        with self._get_conn() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    file_id             TEXT PRIMARY KEY,
+                    file_name           TEXT NOT NULL,
+                    file_size           INTEGER NOT NULL,
+                    mime_type           TEXT NOT NULL,
+                    author_id           TEXT NOT NULL,
+                    author_public_key   BLOB NOT NULL,
+                    replica_count       INTEGER NOT NULL DEFAULT 0,
+                    author_signature    BLOB NOT NULL,
+                    timestamp           REAL NOT NULL,
+                    previous_file_id    TEXT DEFAULT '',
+                    is_deleted          INTEGER DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS replicas (
+                    file_id     TEXT NOT NULL,
+                    node_id     TEXT NOT NULL,
+                    added_at    REAL NOT NULL,
+                    is_local    INTEGER DEFAULT 0,
+                    PRIMARY KEY (file_id, node_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_author ON files(author_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_replica ON files(replica_count)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id)"
+            )
+            conn.commit()
+
+        self._load_cache()
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _load_cache(self) -> None:
+        """Load all non-deleted entries into memory."""
+        with self._lock:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM files WHERE is_deleted = 0"
+                ).fetchall()
+            self.entries.clear()
+            for row in rows:
+                entry = self._row_to_entry(dict(row))
+                self.entries[entry.file_id] = entry
+
+    def _row_to_entry(self, row: dict) -> FileRegistryEntry:
+        """Convert a DB row dict to a FileRegistryEntry."""
+        with self._get_conn() as conn:
+            rep_rows = conn.execute(
+                "SELECT node_id, added_at FROM replicas WHERE file_id = ?",
+                (row["file_id"],),
+            ).fetchall()
+        replicas = [
+            ReplicaEntry(node_id=r["node_id"], added_at=r["added_at"])
+            for r in rep_rows
+        ]
+        return FileRegistryEntry(
+            file_id=row["file_id"],
+            file_name=row["file_name"],
+            file_size=row["file_size"],
+            mime_type=row["mime_type"],
+            author_id=row["author_id"],
+            author_public_key=bytes(row["author_public_key"]),
+            replica_count=row["replica_count"],
+            author_signature=bytes(row["author_signature"]),
+            replicas=replicas,
+            timestamp=row["timestamp"],
+            previous_file_id=row["previous_file_id"] or "",
+            is_deleted=bool(row["is_deleted"]),
+        )
+
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
+
+    def add(self, entry: FileRegistryEntry) -> None:
+        """INSERT OR REPLACE entry and its replicas."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO files
+                    (file_id, file_name, file_size, mime_type, author_id,
+                     author_public_key, replica_count, author_signature,
+                     timestamp, previous_file_id, is_deleted)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry.file_id,
+                        entry.file_name,
+                        entry.file_size,
+                        entry.mime_type,
+                        entry.author_id,
+                        entry.author_public_key,
+                        entry.replica_count,
+                        entry.author_signature,
+                        entry.timestamp,
+                        entry.previous_file_id,
+                        1 if entry.is_deleted else 0,
+                    ),
+                )
+                for r in entry.replicas:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO replicas (file_id, node_id, added_at) VALUES (?, ?, ?)",
+                        (entry.file_id, r.node_id, r.added_at),
+                    )
+                conn.commit()
+            self.entries[entry.file_id] = entry
+
+    def update(self, entry: FileRegistryEntry) -> None:
+        """Update only if incoming timestamp > existing."""
+        existing = self.entries.get(entry.file_id)
+        if existing is None or entry.timestamp > existing.timestamp:
+            self.add(entry)
+
+    def get(self, file_id: str) -> Optional[FileRegistryEntry]:
+        """Get entry from cache."""
+        return self.entries.get(file_id)
+
+    def get_all(self) -> list[FileRegistryEntry]:
+        """All non-deleted entries."""
+        return [e for e in self.entries.values() if not e.is_deleted]
+
+    def get_by_author(self, author_id: str) -> list[FileRegistryEntry]:
+        """Files by a specific author."""
+        return [e for e in self.entries.values() if e.author_id == author_id]
+
+    def mark_deleted(self, file_id: str) -> None:
+        """Mark file as deleted."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE files SET is_deleted = 1 WHERE file_id = ?",
+                    (file_id,),
+                )
+                conn.commit()
+            self.entries.pop(file_id, None)
+
+    # ------------------------------------------------------------------
+    # Replica management
+    # ------------------------------------------------------------------
+
+    def increment_replica(self, file_id: str, node_id: str) -> None:
+        """Add a replica and increment count."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO replicas (file_id, node_id, added_at) VALUES (?, ?, ?)",
+                    (file_id, node_id, now),
+                )
+                conn.execute(
+                    "UPDATE files SET replica_count = replica_count + 1 WHERE file_id = ?",
+                    (file_id,),
+                )
+                conn.commit()
+            entry = self.entries.get(file_id)
+            if entry:
+                entry.replica_count += 1
+                entry.replicas.append(ReplicaEntry(node_id=node_id, added_at=now))
+
+    def decrement_replica(self, file_id: str, node_id: str) -> None:
+        """Remove a replica and decrement count (min 0)."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "DELETE FROM replicas WHERE file_id = ? AND node_id = ?",
+                    (file_id, node_id),
+                )
+                conn.execute(
+                    "UPDATE files SET replica_count = MAX(0, replica_count - 1) WHERE file_id = ?",
+                    (file_id,),
+                )
+                conn.commit()
+            entry = self.entries.get(file_id)
+            if entry:
+                entry.replica_count = max(0, entry.replica_count - 1)
+                entry.replicas = [
+                    r for r in entry.replicas if r.node_id != node_id
+                ]
+
+    def remove_peer_replicas(self, node_id: str) -> list[str]:
+        """Remove all replicas hosted by a peer. Returns affected file_ids."""
+        affected: list[str] = []
+        with self._lock:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT file_id FROM replicas WHERE node_id = ?", (node_id,)
+                ).fetchall()
+                affected = [r["file_id"] for r in rows]
+                conn.execute(
+                    "DELETE FROM replicas WHERE node_id = ?", (node_id,)
+                )
+                for fid in affected:
+                    conn.execute(
+                        "UPDATE files SET replica_count = MAX(0, replica_count - 1) WHERE file_id = ?",
+                        (fid,),
+                    )
+                conn.commit()
+            for fid in affected:
+                entry = self.entries.get(fid)
+                if entry:
+                    entry.replica_count = max(0, entry.replica_count - 1)
+                    entry.replicas = [
+                        r for r in entry.replicas if r.node_id != node_id
+                    ]
+        return affected
+
+    # ------------------------------------------------------------------
+    # Gossip / sync
+    # ------------------------------------------------------------------
+
+    def compute_hash(self) -> str:
+        """SHA-256 of all (file_id, timestamp) pairs sorted."""
+        with self._lock:
+            pairs = sorted(
+                (e.file_id, e.timestamp) for e in self.entries.values()
+            )
+        data = "".join(f"{fid}:{ts}" for fid, ts in pairs).encode("utf-8")
+        return hashlib.sha256(data).hexdigest()
+
+    def get_delta(self, their_hash: str) -> list[FileRegistryEntry]:
+        """Return entries if hashes differ (full sync for now)."""
+        if their_hash == self.compute_hash():
+            return []
+        return self.get_all()
+
+    def merge_delta(self, entries: list[FileRegistryEntry]) -> None:
+        """Merge entries from another peer (latest timestamp wins)."""
+        for entry in entries:
+            existing = self.entries.get(entry.file_id)
+            if existing is None or entry.timestamp > existing.timestamp:
+                self.add(entry)
+
+    # ------------------------------------------------------------------
+    # Verification
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def verify_author_signature(entry: FileRegistryEntry) -> bool:
+        """Verify the author signature on a registry entry."""
+        import struct
+
+        pb = (
+            __import__("wire").PayloadBuilder()
+            .add_string(entry.file_id)
+            .add_string(entry.file_name)
+            .add_uint64(entry.file_size)
+            .add_string(entry.mime_type)
+            .add_string(entry.author_id)
+            .add_uint64(int(entry.timestamp * 1_000_000))
+        )
+        signed_data = pb.build()
+        return AuthorIdentity.verify(
+            signed_data, entry.author_signature, entry.author_public_key
+        )
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def total_unique_file_size(self) -> int:
+        """Sum of all unique file sizes."""
+        return sum(e.file_size for e in self.entries.values() if not e.is_deleted)
+
+    def count(self) -> int:
+        """Number of non-deleted files."""
+        return len([e for e in self.entries.values() if not e.is_deleted])
+
+    def cleanup_old_versions(self, max_age_seconds: float = 86400) -> int:
+        """Remove old versions where a newer one exists via previous_file_id chain."""
+        removed = 0
+        now = time.time()
+        with self._lock:
+            # Find old versions: entries where a newer version exists
+            # and timestamp < now - max_age_seconds
+            new_ids: set[str] = {
+                e.previous_file_id
+                for e in self.entries.values()
+                if e.previous_file_id
+            }
+            for fid in list(new_ids):
+                entry = self.entries.get(fid)
+                if entry and entry.timestamp < now - max_age_seconds:
+                    with self._get_conn() as conn:
+                        conn.execute(
+                            "DELETE FROM files WHERE file_id = ?", (fid,)
+                        )
+                        conn.execute(
+                            "DELETE FROM replicas WHERE file_id = ?", (fid,)
+                        )
+                        conn.commit()
+                    self.entries.pop(fid, None)
+                    removed += 1
+        return removed
+
+    def get_version_chain(self, file_id: str) -> list[str]:
+        """Follow previous_file_id links to build the full version chain (oldest first)."""
+        chain: list[str] = []
+        current = file_id
+        visited: set[str] = set()
+
+        # Walk back to oldest
+        temp: list[str] = []
+        while current and current not in visited:
+            visited.add(current)
+            entry = self.entries.get(current)
+            if entry is None:
+                break
+            temp.append(current)
+            current = entry.previous_file_id
+            if not current:
+                break
+
+        # Reverse to get oldest first
+        chain = list(reversed(temp))
+        return chain

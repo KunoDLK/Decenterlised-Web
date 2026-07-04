@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Decentralised Web</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- Title Bar -->
+    <div class="title-bar">
+        <div class="title-bar-left">
+            <span class="network-name" id="networkName">Decentralised Web</span>
+            <span class="author-name" id="authorName"></span>
+            <button class="btn btn-ghost" id="shareNetworkBtn">Share Network</button>
+        </div>
+        <div class="title-bar-right">
+            <span class="node-id" id="nodeIdDisplay"></span>
+            <button class="btn btn-ghost" id="logoutBtn">Logout</button>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- Left Panel (collapsible) -->
+        <div class="side-panel" id="sidePanel">
+            <div class="side-panel-header">
+                <h3>Connect</h3>
+                <button class="btn btn-ghost" id="hideSidePanel">✕</button>
+            </div>
+            <div class="qr-container" id="qrContainer">
+                <canvas id="qrCanvas"></canvas>
+            </div>
+            <div class="side-panel-actions">
+                <button class="btn btn-primary" id="copyLinkBtn">📋 Copy Link</button>
+                <button class="btn btn-ghost" id="pastePeerBtn">📎 Paste Peer</button>
+                <button class="btn btn-ghost" id="scanQrBtn">📷 Scan QR</button>
+            </div>
+            <div class="peer-list" id="peerList"></div>
+        </div>
+
+        <!-- Center Panel -->
+        <div class="center-panel">
+            <!-- Tabs -->
+            <div class="tab-bar">
+                <button class="tab active" data-tab="browse">Browse</button>
+                <button class="tab" data-tab="myfiles">My Files</button>
+                <button class="tab" data-tab="settings">Settings</button>
+            </div>
+
+            <!-- Search & Upload -->
+            <div class="toolbar">
+                <input type="text" class="search-box" id="searchBox" placeholder="Search files...">
+                <button class="btn btn-primary" id="uploadBtn">+ Upload</button>
+                <input type="file" id="uploadInput" style="display:none" multiple>
+            </div>
+
+            <!-- File List -->
+            <div class="file-list" id="fileList"></div>
+
+            <!-- Settings Tab -->
+            <div class="settings-panel" id="settingsPanel" style="display:none">
+                <h3>Storage Quota</h3>
+                <div class="setting-row">
+                    <label>Max Storage (MB):</label>
+                    <input type="number" id="quotaInput" min="10" step="10">
+                    <button class="btn btn-primary" id="saveQuotaBtn">Save</button>
+                </div>
+                <p class="warning" id="quotaWarning"></p>
+
+                <h3>Network Name</h3>
+                <div class="setting-row">
+                    <input type="text" id="networkNameInput">
+                    <button class="btn btn-primary" id="saveNetworkNameBtn">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Bar -->
+    <div class="bottom-bar">
+        <div class="storage-info">
+            <div class="storage-bar-container">
+                <div class="storage-bar" id="storageBar"></div>
+            </div>
+            <span class="storage-text" id="storageText">0 / 500 MB</span>
+        </div>
+        <div class="health-indicator" id="healthIndicator">
+            <span class="status-dot reconnecting"></span>
+            <span id="healthText">Reconnecting...</span>
+        </div>
+        <span class="peer-count" id="peerCount">0 peers</span>
+    </div>
+
+    <!-- Update File Modal -->
+    <input type="file" id="updateInput" style="display:none" data-file-id="">
+
+    <!-- Share Modal -->
+    <div class="modal-overlay" id="shareModal" style="display:none">
+        <div class="modal">
+            <h3>Share File</h3>
+            <input type="text" id="shareUrlInput" readonly>
+            <div class="modal-actions">
+                <button class="btn btn-primary" id="copyShareUrlBtn">Copy</button>
+                <button class="btn btn-ghost" id="closeShareModal">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -184,6 +184,7 @@ body {
     display: flex;
     align-items: center;
     gap: 12px;
+    animation: fadeIn 0.3s ease;
 }
 .file-row:hover { background: var(--card); }
 .file-row.expanded { background: var(--card); }
@@ -303,12 +304,14 @@ body {
     justify-content: center;
     align-items: center;
     z-index: 100;
+    animation: fadeIn 0.2s ease;
 }
 .modal {
     background: var(--surface);
     padding: 24px;
     border-radius: var(--radius);
     width: 400px;
+    animation: slideIn 0.3s ease;
 }
 .modal h3 { margin-bottom: 12px; }
 .modal input {
@@ -325,3 +328,156 @@ body {
 /* Animations */
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 @keyframes slideIn { from { transform: translateX(-20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+/* Side panel slide animation */
+.side-panel:not(.collapsed) {
+    animation: slideIn 0.3s ease;
+}
+
+/* Download toast */
+.download-toast {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text);
+    min-width: 180px;
+    animation: slideIn 0.3s ease;
+}
+.download-toast .mini-progress-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--card);
+    border-radius: 2px;
+    margin-top: 4px;
+    overflow: hidden;
+}
+.download-toast .mini-progress-bar div {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s;
+}
+
+/* ========================================================================
+   Responsive Media Queries
+   ======================================================================== */
+
+/* Tablet: stack side panel above */
+@media (max-width: 768px) {
+    .main-container {
+        flex-direction: column;
+    }
+
+    .side-panel {
+        width: 100%;
+        max-height: 200px;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        flex-shrink: 0;
+    }
+    .side-panel.collapsed {
+        max-height: 0;
+        width: 100%;
+    }
+
+    .center-panel {
+        min-height: 0;
+    }
+
+    .file-row {
+        padding: 8px 10px;
+        font-size: 13px;
+    }
+
+    .file-actions .btn-sm {
+        padding: 4px 8px;
+        font-size: 12px;
+    }
+
+    .title-bar {
+        padding: 6px 10px;
+        font-size: 13px;
+    }
+    .network-name { font-size: 14px; }
+
+    .bottom-bar {
+        padding: 6px 10px;
+        font-size: 11px;
+    }
+
+    .modal {
+        width: 90vw;
+    }
+}
+
+/* Mobile: single column, compact */
+@media (max-width: 480px) {
+    .title-bar {
+        flex-direction: column;
+        gap: 4px;
+        padding: 6px 8px;
+    }
+    .title-bar-left, .title-bar-right {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .side-panel {
+        display: none; /* hidden by default on mobile */
+    }
+    .side-panel.collapsed {
+        display: none;
+    }
+
+    .tab {
+        padding: 8px 12px;
+        font-size: 13px;
+    }
+
+    .toolbar {
+        padding: 8px 10px;
+        gap: 6px;
+    }
+    .search-box {
+        font-size: 13px;
+        padding: 6px 10px;
+    }
+
+    .file-row {
+        padding: 6px 8px;
+        gap: 8px;
+    }
+    .file-icon { font-size: 16px; }
+    .file-name { font-size: 13px; }
+    .file-meta { font-size: 11px; }
+    .file-actions .btn-sm {
+        padding: 4px 6px;
+        font-size: 11px;
+    }
+
+    .bottom-bar {
+        flex-wrap: wrap;
+        gap: 6px;
+        font-size: 11px;
+    }
+    .storage-bar-container {
+        width: 120px;
+    }
+
+    .btn {
+        padding: 8px 14px;
+        font-size: 14px; /* larger touch targets */
+    }
+
+    .login-card {
+        width: 90vw;
+        padding: 24px;
+    }
+
+    .modal {
+        width: 95vw;
+        padding: 16px;
+    }
+}

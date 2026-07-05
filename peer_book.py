@@ -194,48 +194,67 @@ class PeerBook:
     def recalculate_tiers(self, file_registry: "FileRegistry") -> None:
         """Recalculate tiers for all peers.
 
-        Tier 1: peers that are author of any file in local storage OR host
-                a replica of a file this node authored.
-        Tier 2: last_seen within 7 days AND not Tier 1.
-        Tier 3: all others.
+        Tier assignment logic:
+          Tier 1 — "trusted circle":
+            - Peer authored at least one file this node currently stores locally.
+            - (Future / full plan): also peers that host replicas of files *we*
+              authored.  That requires an author_id on this node and a replicas
+              table cross-reference.  Currently that second check is skipped
+              because the simplified single-node deployment does not populate
+              its own author_id in a way that makes replica-hosting queries
+              meaningful.  When the full replication layer is active, add a
+              query against the replicas table filtered by our author_id.
+
+          Tier 2 — "recently seen":
+            - last_seen within TIER_2_RECENT_DAYS (default 7) AND not Tier 1.
+
+          Tier 3 — "stale / unknown":
+            - Everyone else.
+
+        Uses a single batch UPDATE with executemany instead of per-row commits.
         """
         now = time.time()
         cutoff = now - TIER_2_RECENT_DAYS * 86400
 
-        # Determine Tier 1 candidates
+        # ---- Tier 1 candidates ----
         tier1_ids: set[str] = set()
 
-        # Peers that authored files stored on this node
+        # Peers that authored files this node stores locally
         for entry in file_registry.get_all():
             if file_registry.storage and file_registry.storage.has_file(
                 entry.file_id
             ):
                 tier1_ids.add(entry.author_id)
 
-        # Peers hosting replicas of files this node authored (if we have an author_id)
-        # This is done by checking replicas table for files authored by us
-        # Simplified: check all replica node_ids for files we authored
-        # We'll do a broader calculation
+        # (Future) Peers hosting replicas of files we authored.
+        # Omitted in simplified mode — see docstring.
+
+        # ---- Calculate tier for every peer ----
+        tier_updates: list[tuple[int, str]] = []
 
         with self._lock:
             with self._get_conn() as conn:
-                rows = conn.execute("SELECT node_id, last_seen FROM peers").fetchall()
+                rows = conn.execute(
+                    "SELECT node_id, last_seen FROM peers"
+                ).fetchall()
 
             for row in rows:
                 nid = row["node_id"]
-                last_seen = row["last_seen"]
                 if nid in tier1_ids:
                     tier = 1
-                elif last_seen >= cutoff:
+                elif row["last_seen"] >= cutoff:
                     tier = 2
                 else:
                     tier = 3
+                tier_updates.append((tier, nid))
 
-                with self._get_conn() as conn:
-                    conn.execute(
-                        "UPDATE peers SET tier = ? WHERE node_id = ?", (tier, nid)
-                    )
-                    conn.commit()
+            # Single batch UPDATE
+            with self._get_conn() as conn:
+                conn.executemany(
+                    "UPDATE peers SET tier = ? WHERE node_id = ?",
+                    tier_updates,
+                )
+                conn.commit()
 
     # ------------------------------------------------------------------
     # Maintenance

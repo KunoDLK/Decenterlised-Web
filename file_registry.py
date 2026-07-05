@@ -273,10 +273,22 @@ class FileRegistry:
         return hashlib.sha256(data).hexdigest()
 
     def get_delta(self, their_hash: str) -> list[FileRegistryEntry]:
-        """Return entries if hashes differ (full sync for now)."""
+        """Return delta: empty if hashes match; full if new peer; last-24h otherwise."""
         if their_hash == self.compute_hash():
             return []
-        return self.get_all()
+        # New peer (empty/None hash) → full sync
+        if not their_hash:
+            return self.get_all()
+        # Hashes differ → return entries modified in the last 24 hours
+        since = time.time() - 86400
+        return self.get_entries_since(since)
+
+    def get_entries_since(self, timestamp: float) -> list[FileRegistryEntry]:
+        """Return all non-deleted entries with timestamp > the given value."""
+        return [
+            e for e in self.entries.values()
+            if not e.is_deleted and e.timestamp > timestamp
+        ]
 
     def merge_delta(self, entries: list[FileRegistryEntry]) -> None:
         """Merge entries from another peer (latest timestamp wins)."""

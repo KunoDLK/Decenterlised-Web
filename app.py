@@ -63,6 +63,7 @@ BOOTSTRAP_PEERS: list[tuple[str, str, str, int]] = [
 ]
 
 MIN_PUBLISH_BYTES: int = 1_048_576  # 1MB
+MAX_CONCURRENT_HOLE_PUNCH: int = 10
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,9 @@ class App:
 
         # Ensure data directory exists
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+
+        # Lock file — prevent two instances from sharing a data dir
+        self._acquire_lock()
 
         # Load/create NodeIdentity
         self.node_identity = NodeIdentity.load_or_create(self.data_dir)
@@ -885,12 +889,42 @@ class App:
             finally:
                 self.stop()
 
+    # ==================================================================
+    # Data-dir locking
+    # ==================================================================
+
+    def _acquire_lock(self) -> None:
+        """Prevent two instances from sharing the same data directory."""
+        lock_path = os.path.join(self.data_dir, ".lock")
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path) as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)  # signal 0 = just check if process exists
+                print(f"ERROR: Data dir '{self.data_dir}' is locked by PID {old_pid}")
+                print("       Use --data-dir to specify a different directory.")
+                sys.exit(1)
+            except (ValueError, ProcessLookupError, OSError):
+                # PID is stale — overwrite
+                pass
+        with open(lock_path, "w") as f:
+            f.write(str(os.getpid()))
+
+    def _release_lock(self) -> None:
+        lock_path = os.path.join(self.data_dir, ".lock")
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+
     def stop(self) -> None:
         """Graceful shutdown."""
         print("Shutting down...")
         if self.tui:
             self.tui.stop()
         self.udp_engine.stop()
+        self._release_lock()
         print("Goodbye.")
 
     def _reconnect(self) -> None:
@@ -1086,7 +1120,7 @@ def main() -> None:
     parser.add_argument("--web-host", default="127.0.0.1", help="Web UI bind address")
     parser.add_argument(
         "--data-dir",
-        default=os.path.expanduser("~/.decentralised-web"),
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
         help="Data directory",
     )
     parser.add_argument("--storage-limit", type=int, default=500, help="Max storage in MB")

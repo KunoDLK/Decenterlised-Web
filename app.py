@@ -40,6 +40,7 @@ from protocol import (
     FileUpdatePayload,
     FileDeletePayload,
     FileRegistryEntry,
+    ReplicaEntry,
     HelloPayload,
     PeerListResponsePayload,
     FileRegistryResponsePayload,
@@ -120,10 +121,8 @@ class App:
         self.no_lan = args.no_lan
         self.storage_limit_mb = args.storage_limit
         self.log_file = args.log  # e.g. "app.log"
+        self.udp_trace_file = args.udp_trace  # e.g. "packets.hex"
         self._stopped = False  # guard against double-stop
-
-        # Ensure data directory exists
-        Path(self.data_dir).mkdir(parents=True, exist_ok=True)
 
         # Ensure data directory exists
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
@@ -131,6 +130,8 @@ class App:
         # Configure logging **before** any module creates a logger
         if self.log_file:
             log_utils.configure(self.data_dir, self.log_file, self.no_tui)
+        if self.udp_trace_file:
+            log_utils.configure_udp_trace(self.data_dir, self.udp_trace_file)
 
         self._log = logging.getLogger("app")
 
@@ -245,7 +246,8 @@ class App:
         from connection import new_connection, mark_connected
 
         conn = self.udp_engine.connections.get(p.node_id)
-        if conn is None:
+        was_new = conn is None
+        if was_new:
             conn = new_connection(p.node_id, p.public_key, from_addr)
             self.udp_engine.connections[p.node_id] = conn
             self._log.info("New peer %s from %s:%d", p.node_id[:12], *from_addr)
@@ -254,12 +256,12 @@ class App:
         conn.uptime_since = p.uptime_since
         self.udp_engine._addr_to_node_id[from_addr] = p.node_id
 
-        self._log.info("Peer connected: %s (%s:%d)", p.node_id[:12], *from_addr)
-        self.event_bus.emit("peer_connected", node_id=p.node_id)
-
-        # Send our hello back
-        hello_payload = MessageBuilder.hello(self.udp_engine._build_hello_payload())
-        self.udp_engine.send_to(p.node_id, MsgType.HELLO, hello_payload)
+        # Only reply with HELLO on first contact to avoid HELLO storms
+        if was_new:
+            self._log.info("Peer connected: %s (%s:%d)", p.node_id[:12], *from_addr)
+            self.event_bus.emit("peer_connected", node_id=p.node_id)
+            hello_payload = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+            self.udp_engine.send_to(p.node_id, MsgType.HELLO, hello_payload)
 
     def _handle_ping(self, wire_msg, p, from_addr) -> None:
         sender_id = self.udp_engine.resolve_node_id(from_addr)
@@ -268,13 +270,7 @@ class App:
             conn = self.udp_engine.connections.get(sender_id)
             if conn:
                 conn.last_seen = time.time()
-            # Reply with ping
-            from protocol import PingPayload
-            self.udp_engine.send_to(
-                sender_id,
-                MsgType.PING,
-                MessageBuilder.ping(PingPayload(node_id=self.node_identity.node_id)),
-            )
+            # Do NOT reply — PING is a one-way heartbeat; replying creates a storm
 
     def _handle_goodbye(self, wire_msg, p, from_addr) -> None:
         sender_id = self.udp_engine.resolve_node_id(from_addr)
@@ -358,19 +354,35 @@ class App:
     def _handle_file_request(self, wire_msg, p, from_addr) -> None:
         sender_id = self.udp_engine.resolve_node_id(from_addr)
         if not sender_id:
+            self._log.warning("FILE_REQUEST for %s from unknown addr %s:%d — ignored",
+                              p.file_id[:12], *from_addr)
             return
         if self.storage.has_file(p.file_id):
             data = self.storage.read_file(p.file_id)
+            self._log.info("FILE_REQUEST %s from %s (%d chars) — uploading %d bytes",
+                            p.file_id[:12], sender_id, len(sender_id), len(data))
             self.udp_engine.upload_file(sender_id, p.file_id, data)
+        else:
+            self._log.warning("FILE_REQUEST %s from %s — file not on disk",
+                              p.file_id[:12], sender_id[:12])
 
     def _handle_file_chunk(self, wire_msg, p, from_addr) -> None:
         ds = self.udp_engine.pending_downloads.get(p.file_id)
         if ds is None:
             ds = __import__("udp_engine").DownloadState(p.file_id, "")
             self.udp_engine.pending_downloads[p.file_id] = ds
+            self._log.info("Download started: %s (chunk %d/%d, %d bytes)",
+                            p.file_id[:12], p.chunk_index + 1, p.total_chunks, len(p.data))
 
         ds.total_chunks = p.total_chunks
         ds.received[p.chunk_index] = p.data
+
+        received = len(ds.received)
+        # Log progress every 10 chunks or at first/last
+        if p.chunk_index == 0 or received == ds.total_chunks or received % 10 == 0:
+            pct = received * 100 // max(ds.total_chunks, 1)
+            self._log.info("Download %s: chunk %d/%d (%d%%)",
+                            p.file_id[:12], received, ds.total_chunks, pct)
 
         # Send chunk ACK
         sender_id = self.udp_engine.resolve_node_id(from_addr)
@@ -385,12 +397,23 @@ class App:
             )
 
         # Check completion
-        if len(ds.received) == ds.total_chunks:
+        if received == ds.total_chunks:
             chunks = [ds.received[i] for i in range(ds.total_chunks)]
             data = b"".join(chunks)
-            # Verify hash
-            actual = hashlib.sha256(data).hexdigest()
-            if actual == p.file_id:
+            # Verify integrity: file_id = SHA-256(data + author_id + timestamp)
+            entry = self.file_registry.get(p.file_id)
+            integrity_ok = False
+            if entry is not None:
+                expected = hashlib.sha256(
+                    data + entry.author_id.encode() + str(entry.timestamp).encode()
+                ).hexdigest()
+                integrity_ok = (expected == p.file_id)
+            else:
+                integrity_ok = True  # no entry to verify against, accept
+
+            if integrity_ok:
+                self._log.info("Download complete: %s (%d bytes, integrity OK)",
+                                p.file_id[:12], len(data))
                 self.storage.store_temporary_replica(p.file_id, data, "")
                 self.file_registry.increment_replica(p.file_id, self.node_identity.node_id)
                 # Broadcast file announce
@@ -405,9 +428,11 @@ class App:
                     MsgType.FILE_ANNOUNCE,
                     MessageBuilder.file_announce(announce),
                 )
+            else:
+                self._log.error("Download %s: integrity check failed!", p.file_id[:12])
             ds.download_complete.set()
 
-        # Progress
+        # Progress event
         if ds.total_chunks > 0:
             progress = len(ds.received) / ds.total_chunks
             self.event_bus.emit(
@@ -429,11 +454,15 @@ class App:
             else:
                 # Upload complete
                 self.udp_engine.upload_queue.pop((sender_id, p.file_id), None)
+                self._log.info("Upload complete: %s → %s (%d chunks)",
+                                p.file_id[:12], sender_id[:12], state.total_chunks)
 
     # ---- File announce / replication ----
 
     def _handle_file_announce(self, wire_msg, p: FileAnnouncePayload, from_addr) -> None:
         self.file_registry.increment_replica(p.file_id, p.node_id)
+        self._log.info("File announce: %s now has replica from %s",
+                        p.file_id[:12], p.node_id[:12])
 
     def _handle_replication_solicit(self, wire_msg, p: ReplicationSolicitPayload, from_addr) -> None:
         accepted = self.replication.consider_solicit(p)
@@ -467,6 +496,9 @@ class App:
         pb.add_uint64(int(p.timestamp * 1_000_000))
         if not AuthorIdentity.verify(pb.build(), p.author_signature, p.author_public_key):
             return
+
+        # Resolve sender so we can list them as a replica holder
+        sender_id = self.udp_engine.resolve_node_id(from_addr) or ""
         entry = FileRegistryEntry(
             file_id=p.file_id,
             file_name=p.file_name,
@@ -476,11 +508,21 @@ class App:
             author_public_key=p.author_public_key,
             replica_count=1,
             author_signature=p.author_signature,
-            replicas=[],
+            replicas=[ReplicaEntry(node_id=sender_id, added_at=p.timestamp)],
             timestamp=p.timestamp,
         )
         self.file_registry.add(entry)
+        self._log.info("File published by %s: %s (%d bytes)", sender_id[:12], p.file_name, p.file_size)
         self.event_bus.emit("file_added", file_id=p.file_id)
+
+        # Immediately try to replicate — download from the publisher in background
+        if not self.storage.has_file(p.file_id) and self.storage.available_bytes() >= p.file_size:
+            self._log.info("Replicating %s from publisher %s", p.file_id[:12], sender_id[:12])
+            threading.Thread(
+                target=self._replicate_file,
+                args=(p.file_id, sender_id, p.file_name),
+                daemon=True,
+            ).start()
 
     def _handle_file_update(self, wire_msg, p: FileUpdatePayload, from_addr) -> None:
         import struct
@@ -497,6 +539,7 @@ class App:
         existing = self.file_registry.get(p.previous_file_id)
         if existing and existing.author_id != p.author_id:
             return  # Not the original author
+        sender_id = self.udp_engine.resolve_node_id(from_addr) or ""
         entry = FileRegistryEntry(
             file_id=p.file_id,
             file_name=p.file_name,
@@ -506,7 +549,7 @@ class App:
             author_public_key=p.author_public_key,
             replica_count=1,
             author_signature=p.author_signature,
-            replicas=[],
+            replicas=[ReplicaEntry(node_id=sender_id, added_at=p.timestamp)],
             timestamp=p.timestamp,
             previous_file_id=p.previous_file_id,
         )
@@ -659,8 +702,10 @@ class App:
             raise ValueError("Browse-only mode — cannot publish")
 
         timestamp = time.time()
+        # Round to microseconds so wire decode produces the identical string
+        timestamp_us = round(timestamp * 1_000_000) / 1_000_000.0
         file_id = hashlib.sha256(
-            data + self.author_identity.author_id.encode() + str(timestamp).encode()
+            data + self.author_identity.author_id.encode() + str(timestamp_us).encode()
         ).hexdigest()
 
         # Store locally
@@ -677,7 +722,7 @@ class App:
         pb.add_uint64(len(data))
         pb.add_string(mime_type)
         pb.add_string(self.author_identity.author_id)
-        pb.add_uint64(int(timestamp * 1_000_000))
+        pb.add_uint64(int(timestamp_us * 1_000_000))
         signature = self.author_identity.sign(pb.build())
 
         # Build registry entry
@@ -690,8 +735,8 @@ class App:
             author_public_key=self.author_identity.public_key_bytes,
             replica_count=1,
             author_signature=signature,
-            replicas=[],
-            timestamp=timestamp,
+            replicas=[ReplicaEntry(node_id=self.node_identity.node_id, added_at=timestamp_us)],
+            timestamp=timestamp_us,
         )
         self.file_registry.add(entry)
 
@@ -717,6 +762,19 @@ class App:
         """Download a file from the network."""
         return self.udp_engine.download_file(file_id)
 
+    def _replicate_file(self, file_id: str, from_peer: str, file_name: str) -> None:
+        """Background: download *file_id* from *from_peer* and store as replica."""
+        try:
+            data = self.udp_engine.download_file(file_id)
+            self.storage.store_replica(file_id, data)
+            self.file_registry.increment_replica(file_id, self.node_identity.node_id)
+            self._log.info("Replica stored: %s (%d bytes) from %s",
+                            file_id[:12], len(data), from_peer[:12])
+            self.event_bus.emit("file_added", file_id=file_id)
+        except Exception as e:
+            self._log.warning("Replication failed for %s from %s: %s",
+                              file_id[:12], from_peer[:12], e)
+
     def open_file(self, file_id: str) -> bytes:
         """Open a file (download + track as temporary)."""
         return self.udp_engine.download_file(file_id)
@@ -733,8 +791,10 @@ class App:
             raise ValueError("Not the author")
 
         timestamp = time.time()
+        # Round to microseconds so wire decode produces the identical string
+        timestamp_us = round(timestamp * 1_000_000) / 1_000_000.0
         new_file_id = hashlib.sha256(
-            new_data + self.author_identity.author_id.encode() + str(timestamp).encode()
+            new_data + self.author_identity.author_id.encode() + str(timestamp_us).encode()
         ).hexdigest()
 
         self.storage.store_own_file(new_file_id, new_data, existing.file_name, existing.mime_type)
@@ -750,7 +810,7 @@ class App:
         pb.add_uint64(len(new_data))
         pb.add_string(existing.mime_type)
         pb.add_string(self.author_identity.author_id)
-        pb.add_uint64(int(timestamp * 1_000_000))
+        pb.add_uint64(int(timestamp_us * 1_000_000))
         signature = self.author_identity.sign(pb.build())
 
         payload = FileUpdatePayload(
@@ -761,7 +821,7 @@ class App:
             mime_type=existing.mime_type,
             author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            timestamp=timestamp,
+            timestamp=timestamp_us,
             author_signature=signature,
         )
         self.udp_engine.broadcast(
@@ -777,8 +837,8 @@ class App:
             author_public_key=self.author_identity.public_key_bytes,
             replica_count=1,
             author_signature=signature,
-            replicas=[],
-            timestamp=timestamp,
+            replicas=[ReplicaEntry(node_id=self.node_identity.node_id, added_at=timestamp_us)],
+            timestamp=timestamp_us,
             previous_file_id=file_id,
         )
         self.file_registry.add(entry)
@@ -971,9 +1031,12 @@ class App:
 
     def _reconnect(self) -> None:
         """Run the startup reconnection sequence."""
+        self._log.info("=== Reconnect: starting ===")
+
         # Phase 0: Get all known peers
         peers = self.peer_book.get_all_ordered()
         if not peers:
+            self._log.info("Reconnect phase 0: no peers in book, adding bootstrap")
             for node_id, pk_b64, ip, port in BOOTSTRAP_PEERS:
                 self.peer_book.add_or_update(
                     node_id,
@@ -985,43 +1048,64 @@ class App:
                 )
             peers = self.peer_book.get_all_ordered()
 
+        self._log.info("Reconnect phase 0: %d peers in book", len(peers))
+        for p in peers:
+            self._log.debug("  peer %s tier=%d ip=%s:%d",
+                            p["node_id"][:12], p["tier"], p["public_ip"], p["public_port"])
+
         # Phase 1: Connect to Tier 1 peers
         tier1 = [p for p in peers if p["tier"] == 1]
         self.replication.tier1_total = len(tier1)
+        self._log.info("Reconnect phase 1: %d Tier-1 peers", len(tier1))
 
         for peer in tier1[:MAX_CONCURRENT_HOLE_PUNCH]:
             self.replication.tier1_contacted.add(peer["node_id"])
+            self._log.info("Reconnect phase 1: punching %s (%s:%d)",
+                            peer["node_id"][:12], peer["public_ip"], peer["public_port"])
             try:
-                self.udp_engine.hole_punch(
+                ok = self.udp_engine.hole_punch(
                     peer["node_id"],
                     peer["public_ip"],
                     peer["public_port"],
                     bytes(peer["public_key"]),
                 )
-            except Exception:
+                self._log.info("Reconnect phase 1: punch %s → %s",
+                                peer["node_id"][:12], "OK" if ok else "FAIL")
+            except Exception as e:
+                self._log.warning("Reconnect phase 1: punch %s error: %s",
+                                  peer["node_id"][:12], e)
                 self.peer_book.record_failure(peer["node_id"])
+
+        connected = self.udp_engine.get_connected_peers()
+        self._log.info("Reconnect phase 1 done: %d connected", len(connected))
 
         # Phase 2: Exchange file registries with connected peers
         time.sleep(1)
-        for nid in self.udp_engine.get_connected_peers():
+        self._log.info("Reconnect phase 2: exchanging registries with %d peers", len(connected))
+        for nid in connected:
             try:
                 self.udp_engine.send_to(
                     nid,
                     MsgType.FILE_REGISTRY_QUERY,
                     MessageBuilder.file_registry_query(),
                 )
-            except Exception:
-                pass
+                self._log.debug("Reconnect phase 2: registry query → %s", nid[:12])
+            except Exception as e:
+                self._log.warning("Reconnect phase 2: query to %s failed: %s", nid[:12], e)
 
         # Phase 3: Open rebalance gate
+        self._log.info("Reconnect phase 3: opening rebalance gate")
         self.replication.open_gate()
         self.replication.execute_rebalance()
 
         # Phase 4: Try Tier 2, then Tier 3
         for tier in [2, 3]:
             tier_peers = [p for p in peers if p["tier"] == tier]
+            self._log.info("Reconnect phase 4: %d Tier-%d peers", len(tier_peers), tier)
             for peer in tier_peers[:5]:
                 self.replication.tier1_contacted.add(peer["node_id"])
+                self._log.debug("Reconnect phase 4: punching %s (%s:%d)",
+                                peer["node_id"][:12], peer["public_ip"], peer["public_port"])
                 try:
                     self.udp_engine.hole_punch(
                         peer["node_id"],
@@ -1029,23 +1113,33 @@ class App:
                         peer["public_port"],
                         bytes(peer["public_key"]),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log.warning("Reconnect phase 4: punch %s error: %s",
+                                      peer["node_id"][:12], e)
+
+        connected = self.udp_engine.get_connected_peers()
+        self._log.info("Reconnect phase 4 done: %d connected", len(connected))
 
         # Request peer lists from connected peers
-        for nid in self.udp_engine.get_connected_peers():
+        self._log.info("Reconnect: requesting peer lists from %d peers", len(connected))
+        for nid in connected:
             try:
                 self.udp_engine.send_to(
                     nid,
                     MsgType.PEER_LIST_REQUEST,
                     MessageBuilder.peer_list_request(),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self._log.warning("Reconnect: peer list request to %s failed: %s", nid[:12], e)
 
         # Phase 5: LAN broadcast
         if not self.no_lan:
+            self._log.info("Reconnect phase 5: LAN broadcast")
             self.udp_engine.lan_broadcast()
+        else:
+            self._log.info("Reconnect phase 5: LAN broadcast skipped (--no-lan)")
+
+        self._log.info("=== Reconnect: done (%d connected) ===", len(connected))
 
     def _start_periodic_tasks(self) -> None:
         """Start all background periodic tasks."""
@@ -1170,6 +1264,10 @@ def main() -> None:
     parser.add_argument(
         "--log", type=str, default=None,
         help="Log filename inside data dir (e.g. app.log); omit to disable file logging",
+    )
+    parser.add_argument(
+        "--udp-trace", type=str, default=None,
+        help="UDP hex-dump trace filename inside data dir (e.g. packets.hex)",
     )
     parser.add_argument(
         "--tui-port-offset", type=int, default=0,

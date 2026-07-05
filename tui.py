@@ -295,12 +295,22 @@ class TUI:
         entries = self.node.file_registry.get_all()
         if self.selected_index < len(entries):
             entry = entries[self.selected_index]
-            self._set_status(f"Downloading {entry.file_name}...")
-            try:
-                self.node.download_file(entry.file_id)
-                self._set_status(f"Downloaded {entry.file_name}")
-            except Exception as e:
-                self._set_status(f"Download error: {e}")
+            file_id = entry.file_id
+            file_name = entry.file_name
+            self._set_status(f"Download queued: {file_name}")
+            threading.Thread(
+                target=self._do_download,
+                args=(file_id, file_name),
+                daemon=True,
+            ).start()
+
+    def _do_download(self, file_id: str, file_name: str) -> None:
+        """Background download, safe to block."""
+        try:
+            self.node.download_file(file_id)
+            self._set_status(f"Downloaded: {file_name}")
+        except Exception as e:
+            self._set_status(f"Download error: {e}")
 
     def _show_my_url(self) -> None:
         """Copy this node's connection URL to the clipboard."""

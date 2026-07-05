@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Optional, TYPE_CHECKING
 
+import log_utils
 import wire
 from connection import (
     ConnectionState,
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_CHUNK_SIZE: int = 16384
+MAX_CHUNK_SIZE: int = 8192  # 8KB — fits in a single UDP datagram on all platforms
 HOLE_PUNCH_PACKETS: int = 3
 HOLE_PUNCH_INTERVAL: float = 0.1
 HOLE_PUNCH_TIMEOUT: float = 5.0
@@ -140,6 +141,9 @@ class UDPEngine:
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Increase buffer sizes to prevent EMSGSIZE on macOS loopback
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
         self.sock.bind(("0.0.0.0", port))
 
         self.public_ip: str = "0.0.0.0"
@@ -220,9 +224,14 @@ class UDPEngine:
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65535)
+                log_utils.udp_trace("RECV", data, addr)
                 try:
                     wm = wire.decode(data)
-                    self._addr_to_node_id[addr] = wm.sender_id_prefix.hex()
+                    # Only set on first contact; _handle_hello stores the full node_id.
+                    # Overwriting with the prefix would break resolve_node_id() for
+                    # subsequent messages like FILE_REQUEST.
+                    if addr not in self._addr_to_node_id:
+                        self._addr_to_node_id[addr] = wm.sender_id_prefix.hex()
                     self._log.debug(
                         "Rcvd %d bytes | type=%d seq=%d | %s:%d → %s",
                         len(data), wm.msg_type, wm.seq_num,
@@ -263,10 +272,15 @@ class UDPEngine:
             with self._lock:
                 conn = self.connections.get(peer_id)
                 if conn is None:
+                    self._log.warning(
+                        "send_to: peer %s not in connections (%d known) — dropping type=%d",
+                        peer_id[:12], len(self.connections), msg_type,
+                    )
                     return seq_num
                 addr = conn.address
 
         self.sock.sendto(encoded, addr)
+        log_utils.udp_trace("SENT", encoded, addr)
 
         self._log.debug(
             "Sent %d bytes | type=%d seq=%d | → %s:%d peer=%s",
@@ -303,6 +317,14 @@ class UDPEngine:
     ) -> bool:
         """Direct hole punch to a peer. Returns True if connected."""
         addr = (target_ip, target_port)
+
+        # If already connected, don't re-punch
+        with self._lock:
+            existing = self.connections.get(target_id)
+            if existing is not None and existing.is_connected:
+                self._log.debug("hole_punch: %s already connected, skipping", target_id[:12])
+                return True
+
         conn = new_connection(target_id, target_pubkey, addr)
 
         with self._lock:
@@ -407,15 +429,32 @@ class UDPEngine:
         # Find a peer hosting this file
         entry = self.file_registry.get(file_id)
         if entry is None:
+            self._log.warning("download_file: %s not in registry", file_id[:12])
             raise ValueError(f"File {file_id} not in registry")
+
+        self._log.info("download_file: %s (%s, %d bytes, %d replicas)",
+                        file_id[:12], entry.file_name, entry.file_size, entry.replica_count)
 
         host_id = None
         for replica in entry.replicas:
-            if replica.node_id in self.connections:
+            conn = self.connections.get(replica.node_id)
+            if conn and conn.is_connected:
                 host_id = replica.node_id
+                self._log.debug("download_file: found host %s (addr=%s:%d)",
+                                host_id[:12], conn.address[0], conn.address[1])
                 break
+            elif replica.node_id in self.connections:
+                self._log.debug("download_file: replica %s not connected (state=%s)",
+                                replica.node_id[:12],
+                                self.connections[replica.node_id].state)
 
         if host_id is None:
+            self._log.warning("download_file: %s has %d replicas but none connected",
+                              file_id[:12], len(entry.replicas))
+            for replica in entry.replicas:
+                self._log.debug("  replica: %s (in connections=%s)",
+                                replica.node_id[:12],
+                                replica.node_id in self.connections)
             raise ValueError(f"No connected peer hosts file {file_id}")
 
         # Create download state
@@ -423,6 +462,7 @@ class UDPEngine:
         self.pending_downloads[file_id] = ds
 
         # Send FILE_REQUEST
+        self._log.info("download_file: requesting %s from %s", file_id[:12], host_id[:12])
         self.send_to(
             host_id,
             MsgType.FILE_REQUEST,
@@ -430,26 +470,42 @@ class UDPEngine:
         )
 
         # Wait for completion
+        self._log.debug("download_file: waiting for %s (timeout=60s)", file_id[:12])
         ds.download_complete.wait(timeout=60.0)
 
-        if ds.total_chunks == 0 or len(ds.received) != ds.total_chunks:
+        received_count = len(ds.received)
+        expected_count = ds.total_chunks
+        self._log.info("download_file: %s got %d/%d chunks",
+                        file_id[:12], received_count, expected_count)
+
+        if ds.total_chunks == 0 or received_count != expected_count:
             self.pending_downloads.pop(file_id, None)
+            self._log.warning("download_file: %s incomplete (%d/%d chunks)",
+                              file_id[:12], received_count, expected_count)
             raise TimeoutError(f"Download of {file_id} incomplete")
 
         # Reassemble
         chunks = [ds.received[i] for i in range(ds.total_chunks)]
         data = b"".join(chunks)
 
-        # Verify hash
-        expected_hash = file_id
-        actual_hash = hashlib.sha256(data).hexdigest()
-        if actual_hash != expected_hash:
-            self.pending_downloads.pop(file_id, None)
-            raise ValueError(
-                f"Hash mismatch for {file_id}: expected {expected_hash}, got {actual_hash}"
-            )
+        # Verify integrity: file_id = SHA-256(data + author_id + timestamp)
+        entry = self.file_registry.get(file_id)
+        if entry is not None:
+            expected = hashlib.sha256(
+                data + entry.author_id.encode() + str(entry.timestamp).encode()
+            ).hexdigest()
+            if expected != file_id:
+                self.pending_downloads.pop(file_id, None)
+                self._log.error("download_file: %s integrity check failed (expected=%s)",
+                                file_id[:12], expected[:12])
+                raise ValueError(
+                    f"Integrity check failed for {file_id}: expected {expected[:12]}..."
+                )
+            self._log.debug("download_file: %s integrity OK", file_id[:12])
 
         self.pending_downloads.pop(file_id, None)
+        self._log.info("download_file: %s complete (%d bytes, %d chunks)",
+                        file_id[:12], len(data), expected_count)
         return data
 
     def upload_file(self, peer_id: str, file_id: str, data: bytes) -> None:
@@ -459,6 +515,8 @@ class UDPEngine:
             for i in range(0, len(data), MAX_CHUNK_SIZE)
         ]
         total_chunks = len(chunks)
+        self._log.info("upload_file: %s → %s (%d bytes, %d chunks @ %d bytes)",
+                        file_id[:12], peer_id[:12], len(data), total_chunks, MAX_CHUNK_SIZE)
         state = UploadState(peer_id, file_id, chunks, total_chunks)
         self.upload_queue[(peer_id, file_id)] = state
 
@@ -469,16 +527,23 @@ class UDPEngine:
         """Send a single chunk."""
         if chunk_index >= state.total_chunks:
             return
-        payload = MessageBuilder.file_chunk(
-            FileChunkPayload(
-                file_id=state.file_id,
-                chunk_index=chunk_index,
-                total_chunks=state.total_chunks,
-                data=state.chunks[chunk_index],
+        try:
+            payload = MessageBuilder.file_chunk(
+                FileChunkPayload(
+                    file_id=state.file_id,
+                    chunk_index=chunk_index,
+                    total_chunks=state.total_chunks,
+                    data=state.chunks[chunk_index],
+                )
             )
-        )
-        self.send_to(state.peer_id, MsgType.FILE_CHUNK, payload)
-        state.last_sent[chunk_index] = time.time()
+            self.send_to(state.peer_id, MsgType.FILE_CHUNK, payload)
+            state.last_sent[chunk_index] = time.time()
+            self._log.debug("upload_file: %s chunk %d/%d (%d bytes)",
+                             state.file_id[:12], chunk_index + 1, state.total_chunks,
+                             len(state.chunks[chunk_index]))
+        except Exception as e:
+            self._log.error("upload_file: %s chunk %d failed: %s",
+                             state.file_id[:12], chunk_index, e)
 
     # ------------------------------------------------------------------
     # Helpers

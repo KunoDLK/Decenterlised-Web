@@ -6,6 +6,7 @@ Calculate network target, decide which files to replicate/delete, maximise diver
 
 from __future__ import annotations
 
+import logging
 import statistics
 import time
 from typing import Optional, TYPE_CHECKING
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     from storage import StorageManager
     from peer_book import PeerBook
     from udp_engine import UDPEngine
+
+_log = logging.getLogger("replication")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -244,11 +247,17 @@ class ReplicationManager:
         if not self.should_rebalance():
             return
 
+        _log.info("Rebalance: target=%d connected=%d",
+                   self.estimated_network_target,
+                   len(self.udp_engine.get_connected_peers()))
+
         available = self.storage.available_bytes()
         under = self.get_under_replicated()
 
         if under and available > 0:
             to_replicate = self.select_files_to_replicate(available)
+            _log.info("Rebalance: replicating %d under-replicated files (avail=%d bytes)",
+                       len(to_replicate), available)
             for fid in to_replicate:
                 self.solicit_replication(fid)
 
@@ -306,8 +315,11 @@ class ReplicationManager:
             return False
         available = self.storage.available_bytes()
         if payload.file_size > available:
+            _log.debug("Replication solicit %s rejected: need %d, have %d",
+                        payload.file_id[:12], payload.file_size, available)
             return False
         # Accept — download and store
+        _log.info("Accepting replication solicit: %s (%d bytes)", payload.file_id[:12], payload.file_size)
         data = self.udp_engine.download_file(payload.file_id)
         self.storage.store_replica(payload.file_id, data)
         self.file_registry.increment_replica(

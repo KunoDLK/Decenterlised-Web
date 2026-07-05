@@ -7,12 +7,15 @@ Manage files on disk, track storage usage, enforce quotas.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+_log = logging.getLogger("storage")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -73,6 +76,7 @@ class StorageManager:
                 meta["own_files"].append(file_id)
             self._save_metadata(meta)
 
+        _log.info("Store own: %s (%s, %s, %d bytes)", file_id[:12], file_name, mime_type, len(data))
         return filepath
 
     def store_replica(self, file_id: str, data: bytes) -> str:
@@ -89,6 +93,7 @@ class StorageManager:
             meta["temporary_files"].pop(file_id, None)
             self._save_metadata(meta)
 
+        _log.info("Store replica: %s (%d bytes)", file_id[:12], len(data))
         return filepath
 
     def store_temporary_replica(
@@ -107,6 +112,7 @@ class StorageManager:
             }
             self._save_metadata(meta)
 
+        _log.info("Store temporary: %s (%d bytes, tab=%s)", file_id[:12], len(data), tab_id)
         return filepath
 
     def promote_temporary(self, file_id: str) -> None:
@@ -118,6 +124,7 @@ class StorageManager:
                 if file_id not in meta["replica_files"]:
                     meta["replica_files"].append(file_id)
                 self._save_metadata(meta)
+                _log.info("Promoted temporary → replica: %s", file_id[:12])
 
     def cleanup_expired_temporary(self) -> list[str]:
         """Promote expired temporary replicas. Returns promoted file_ids."""
@@ -168,6 +175,7 @@ class StorageManager:
                 ]
                 meta["temporary_files"].pop(file_id, None)
                 self._save_metadata(meta)
+            _log.info("Deleted file: %s", file_id[:12])
             return True
         return False
 

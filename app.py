@@ -8,9 +8,12 @@ launches TUI and/or web server.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
+import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -18,6 +21,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import log_utils
 from identity import (
     NodeIdentity,
     AuthorIdentity,
@@ -115,9 +119,20 @@ class App:
         self.no_tui = args.no_tui
         self.no_lan = args.no_lan
         self.storage_limit_mb = args.storage_limit
+        self.log_file = args.log  # e.g. "app.log"
+        self._stopped = False  # guard against double-stop
 
         # Ensure data directory exists
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+
+        # Ensure data directory exists
+        Path(self.data_dir).mkdir(parents=True, exist_ok=True)
+
+        # Configure logging **before** any module creates a logger
+        if self.log_file:
+            log_utils.configure(self.data_dir, self.log_file, self.no_tui)
+
+        self._log = logging.getLogger("app")
 
         # Lock file — prevent two instances from sharing a data dir
         self._acquire_lock()
@@ -220,6 +235,7 @@ class App:
             + struct.pack(">Q", int(p.uptime_since * 1_000_000))
         )
         if not NodeIdentity.verify(sign_data, p.signature, p.public_key):
+            self._log.warning("HELLO from %s:%d — signature verification failed", *from_addr)
             return
 
         self.peer_book.add_or_update(
@@ -232,11 +248,13 @@ class App:
         if conn is None:
             conn = new_connection(p.node_id, p.public_key, from_addr)
             self.udp_engine.connections[p.node_id] = conn
+            self._log.info("New peer %s from %s:%d", p.node_id[:12], *from_addr)
 
         mark_connected(conn)
         conn.uptime_since = p.uptime_since
         self.udp_engine._addr_to_node_id[from_addr] = p.node_id
 
+        self._log.info("Peer connected: %s (%s:%d)", p.node_id[:12], *from_addr)
         self.event_bus.emit("peer_connected", node_id=p.node_id)
 
         # Send our hello back
@@ -261,6 +279,7 @@ class App:
     def _handle_goodbye(self, wire_msg, p, from_addr) -> None:
         sender_id = self.udp_engine.resolve_node_id(from_addr)
         if sender_id:
+            self._log.info("Peer disconnected: %s", sender_id[:12])
             self.peer_book.mark_offline(sender_id)
             self.file_registry.remove_peer_replicas(sender_id)
             conn = self.udp_engine.connections.pop(sender_id, None)
@@ -646,6 +665,10 @@ class App:
 
         # Store locally
         self.storage.store_own_file(file_id, data, file_name, mime_type)
+        self._log.info(
+            "Published file: %s (%s, %d bytes) id=%s",
+            file_name, mime_type, len(data), file_id[:12],
+        )
 
         # Sign with author key
         pb = PayloadBuilder()
@@ -715,6 +738,10 @@ class App:
         ).hexdigest()
 
         self.storage.store_own_file(new_file_id, new_data, existing.file_name, existing.mime_type)
+        self._log.info(
+            "Updated file: %s → %s (%d bytes)",
+            file_id[:12], new_file_id[:12], len(new_data),
+        )
 
         pb = PayloadBuilder()
         pb.add_string(new_file_id)
@@ -856,11 +883,18 @@ class App:
 
     def start(self) -> None:
         """Start the node."""
+        self._log.info("Node ID: %s", self.node_identity.node_id)
+        self._log.info("Listening on UDP port %s", self.port)
         print(f"Node ID: {self.node_identity.node_id}")
         print(f"Listening on UDP port {self.port}")
 
         # Start UDP engine
         self.udp_engine.start()
+        self._log.info(
+            "Public address: %s:%s",
+            self.udp_engine.public_ip,
+            self.udp_engine.public_port,
+        )
         print(f"Public address: {self.udp_engine.public_ip}:{self.udp_engine.public_port}")
 
         # Run reconnection sequence
@@ -878,7 +912,10 @@ class App:
             from tui import TUI
             self.tui = TUI(self)
             print("Starting TUI... (press 'q' to quit)")
-            self.tui.run()
+            try:
+                self.tui.run()
+            finally:
+                self.stop()
         else:
             # Just wait
             try:
@@ -920,11 +957,16 @@ class App:
 
     def stop(self) -> None:
         """Graceful shutdown."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._log.info("Shutting down...")
         print("Shutting down...")
         if self.tui:
             self.tui.stop()
         self.udp_engine.stop()
         self._release_lock()
+        self._log.info("Goodbye.")
         print("Goodbye.")
 
     def _reconnect(self) -> None:
@@ -1126,12 +1168,21 @@ def main() -> None:
     parser.add_argument("--storage-limit", type=int, default=500, help="Max storage in MB")
     parser.add_argument("--no-lan", action="store_true", help="Disable LAN broadcast")
     parser.add_argument(
+        "--log", type=str, default=None,
+        help="Log filename inside data dir (e.g. app.log); omit to disable file logging",
+    )
+    parser.add_argument(
         "--tui-port-offset", type=int, default=0,
         help="Offset added to all ports for multi-instance testing",
     )
 
     args = parser.parse_args()
     app = App(args)
+
+    # Safety net: ensure lock is always released
+    atexit.register(app._release_lock)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda _s, _f: app.stop() or sys.exit(0))
 
     # Auto-login if credentials provided
     if args.user and args.password:

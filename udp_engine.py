@@ -7,6 +7,7 @@ Core networking module: UDP socket, send/recv loop, hole punching, keepalive, pe
 from __future__ import annotations
 
 import hashlib
+import logging
 import socket
 import threading
 import time
@@ -135,6 +136,7 @@ class UDPEngine:
         self.peer_book = peer_book
         self.file_registry = file_registry
         self.storage = storage
+        self._log = logging.getLogger("udp")
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -175,6 +177,8 @@ class UDPEngine:
             except Exception:
                 self.public_ip = "127.0.0.1"
 
+        self._log.info("UDP engine started on 0.0.0.0:%d (public %s:%d)",
+                        self.port, self.public_ip, self.public_port)
         self.running = True
         self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self.recv_thread.start()
@@ -185,6 +189,8 @@ class UDPEngine:
     def stop(self) -> None:
         """Graceful shutdown."""
         self.running = False
+        self._log.info("UDP engine stopping, sending GOODBYE to %d peers",
+                        sum(1 for c in self.connections.values() if c.is_connected))
         # Send goodbye to all connected peers
         for conn in list(self.connections.values()):
             if conn.is_connected:
@@ -202,6 +208,7 @@ class UDPEngine:
             self.sock.close()
         except Exception:
             pass
+        self._log.info("UDP engine stopped")
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -216,8 +223,14 @@ class UDPEngine:
                 try:
                     wm = wire.decode(data)
                     self._addr_to_node_id[addr] = wm.sender_id_prefix.hex()
+                    self._log.debug(
+                        "Rcvd %d bytes | type=%d seq=%d | %s:%d → %s",
+                        len(data), wm.msg_type, wm.seq_num,
+                        addr[0], addr[1], wm.sender_id_prefix.hex()[:12],
+                    )
                     self.protocol_router.route(wm, addr)
                 except wire.WireError:
+                    self._log.debug("Rcvd %d bytes malformed wire | %s:%d", len(data), *addr)
                     continue
             except socket.timeout:
                 continue
@@ -254,6 +267,11 @@ class UDPEngine:
                 addr = conn.address
 
         self.sock.sendto(encoded, addr)
+
+        self._log.debug(
+            "Sent %d bytes | type=%d seq=%d | → %s:%d peer=%s",
+            len(encoded), msg_type, seq_num, addr[0], addr[1], peer_id[:12],
+        )
 
         if self.reliable.needs_ack(msg_type):
             self.reliable.track_pending(

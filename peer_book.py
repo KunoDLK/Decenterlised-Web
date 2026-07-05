@@ -6,6 +6,7 @@ Persistent directory of all known peers with tiering, last-seen tracking, cleanu
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -14,6 +15,8 @@ from typing import Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from file_registry import FileRegistry
+
+_log = logging.getLogger("peers")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -114,6 +117,7 @@ class PeerBook:
                     ),
                 )
                 conn.commit()
+        _log.debug("Peer %s added/updated (ip=%s:%d tier=3)", node_id[:12], ip, port)
 
     def get(self, node_id: str) -> Optional[dict[str, Any]]:
         """Return peer row as dict or None."""
@@ -170,6 +174,7 @@ class PeerBook:
                     (now, node_id),
                 )
                 conn.commit()
+        _log.info("Peer %s marked offline", node_id[:12])
 
     def record_failure(self, node_id: str) -> None:
         """Increment consecutive_fails. If >= 5, demote tier by 1 (min 3)."""
@@ -190,6 +195,9 @@ class PeerBook:
                     (fails, tier, node_id),
                 )
                 conn.commit()
+        if fails >= CONSECUTIVE_FAILS_DEMOTE:
+            _log.warning("Peer %s demoted to tier %d after %d consecutive failures",
+                          node_id[:12], tier, fails)
 
     def recalculate_tiers(self, file_registry: "FileRegistry") -> None:
         """Recalculate tiers for all peers.

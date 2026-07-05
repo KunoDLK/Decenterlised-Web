@@ -7,10 +7,13 @@ Most logic lives in udp_engine.py.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Literal
+
+_log = logging.getLogger("conn")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -85,20 +88,26 @@ def new_connection(
 
 def mark_connected(conn: ConnectionState) -> None:
     """Transition to CONNECTED, fire hello_received Event, update last_seen."""
+    prev = conn.state
     conn.state = "CONNECTED"
     conn.hello_received.set()
     conn.last_seen = time.time()
+    _log.debug("Peer %s: %s → CONNECTED", conn.node_id[:12], prev)
 
 
 def mark_assisted(conn: ConnectionState) -> None:
     """Transition to ASSISTED."""
+    prev = conn.state
     conn.state = "ASSISTED"
     conn.last_seen = time.time()
+    _log.debug("Peer %s: %s → ASSISTED", conn.node_id[:12], prev)
 
 
 def mark_disconnected(conn: ConnectionState) -> None:
     """Transition to DISCONNECTED."""
+    prev = conn.state
     conn.state = "DISCONNECTED"
+    _log.debug("Peer %s: %s → DISCONNECTED", conn.node_id[:12], prev)
     conn.last_seen = time.time()
 
 

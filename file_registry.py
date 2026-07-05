@@ -7,6 +7,7 @@ Local copy of the network-wide file registry, SQLite-backed, gossiped between pe
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import threading
 import time
@@ -18,6 +19,8 @@ from identity import AuthorIdentity
 
 if TYPE_CHECKING:
     from storage import StorageManager
+
+_log = logging.getLogger("registry")
 
 # ---------------------------------------------------------------------------
 # FileRegistry
@@ -159,6 +162,8 @@ class FileRegistry:
                     )
                 conn.commit()
             self.entries[entry.file_id] = entry
+        _log.info("Registry add: %s (%s, %d bytes, %d replicas)",
+                    entry.file_id[:12], entry.file_name, entry.file_size, entry.replica_count)
 
     def update(self, entry: FileRegistryEntry) -> None:
         """Update only if incoming timestamp > existing."""
@@ -188,6 +193,7 @@ class FileRegistry:
                 )
                 conn.commit()
             self.entries.pop(file_id, None)
+        _log.info("Registry mark deleted: %s", file_id[:12])
 
     # ------------------------------------------------------------------
     # Replica management
@@ -257,6 +263,8 @@ class FileRegistry:
                     entry.replicas = [
                         r for r in entry.replicas if r.node_id != node_id
                     ]
+        if affected:
+            _log.info("Removed replicas for peer %s from %d files", node_id[:12], len(affected))
         return affected
 
     # ------------------------------------------------------------------

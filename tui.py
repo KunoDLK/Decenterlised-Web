@@ -112,6 +112,8 @@ class TUI:
         self.running = False
         self._key_event.set()  # unblock the wait
         self._stop_keyboard()
+        # Give Rich Live display time to release stdout before interpreter exit
+        time.sleep(0.05)
 
     # ==================================================================
     # Keyboard — cbreak mode (char-by-char, output processing ON)

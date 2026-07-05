@@ -1028,6 +1028,11 @@ class App:
         self._release_lock()
         self._log.info("Goodbye.")
         print("Goodbye.")
+        # Let daemon threads (keepalive, rebalance, etc.) notice udp_engine.running
+        # is False and exit, so they don't touch stdout during interpreter shutdown.
+        time.sleep(0.1)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
     def _reconnect(self) -> None:
         """Run the startup reconnection sequence."""

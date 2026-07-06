@@ -125,7 +125,19 @@ def ws_handler(ws):
                 if msg_type == "download":
                     file_id = data.get("file_id")
                     if file_id:
-                        node.download_file(file_id)
+                        if node.storage.has_file(file_id):
+                            # Already downloaded — notify client it's ready
+                            ws.send(json.dumps({
+                                "type": "download_progress",
+                                "file_id": file_id,
+                                "progress": 1.0,
+                                "status": "complete",
+                            }))
+                        else:
+                            # Queue async download via scheduler (non-blocking)
+                            node.scheduler.enqueue(
+                                node._make_solicit_action(file_id)
+                            )
 
                 elif msg_type == "open":
                     file_id = data.get("file_id")

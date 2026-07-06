@@ -447,6 +447,10 @@ class App:
         # Check if download is complete (all chunks received)
         total, _, received = self.file_registry.get_transfer_progress(transfer_id)
         if total > 0 and len(received) >= total:
+            # Skip if we already have the file (prevents duplicate downloads)
+            if self.storage.has_file(p.file_id):
+                self.file_registry.mark_transfer_complete(transfer_id)
+                return
             # Assemble chunks into final file
             try:
                 data = self.storage.assemble_chunks(p.file_id, total)
@@ -924,6 +928,10 @@ class App:
         from_peer = action.params.get("from_peer", "")
         if not file_id:
             return
+        # Skip if we already have the file locally
+        if self.storage.has_file(file_id):
+            self.file_registry.increment_replica(file_id, self.node_identity.node_id)
+            return
         try:
             data = self.download_file(file_id)
             self.storage.store_replica(file_id, data)
@@ -932,6 +940,18 @@ class App:
             self.event_bus.emit("file_added", file_id=file_id)
         except Exception as e:
             self._log.warning("Replication failed for %s: %s", file_id[:12], e)
+
+    def _make_solicit_action(self, file_id: str) -> "Action":
+        """Create a solicit_replication action for async download (used by web UI)."""
+        entry = self.file_registry.get(file_id)
+        peer = ""
+        if entry:
+            for replica in entry.replicas:
+                if self.peer_book.is_connected(replica.node_id):
+                    peer = replica.node_id
+                    break
+        return Action.normal(ActionType.SOLICIT_REPLICATION,
+                            file_id=file_id, from_peer=peer)
 
     # ---- Helper sends ----
 

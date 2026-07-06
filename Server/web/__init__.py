@@ -18,7 +18,13 @@ def create_app(node, web_port: int, web_host: str) -> Flask:
     """
     import os
 
-    app = Flask(__name__, template_folder="web/templates", static_folder="web/static")
+    _web_dir = os.path.dirname(os.path.abspath(__file__))
+
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(_web_dir, "templates"),
+        static_folder=os.path.join(_web_dir, "static"),
+    )
     app.config["SECRET_KEY"] = os.urandom(32).hex()
     app.config["node"] = node
     app.config["web_port"] = web_port

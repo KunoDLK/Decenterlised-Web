@@ -27,6 +27,9 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
+# Ensure the Server package is on the import path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Server"))
+
 # ---------------------------------------------------------------------------
 # Colours for terminal output
 # ---------------------------------------------------------------------------

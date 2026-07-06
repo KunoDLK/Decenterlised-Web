@@ -22,6 +22,8 @@ import time
 from typing import Optional
 from unittest.mock import MagicMock, PropertyMock, patch
 
+# Ensure the Server package is on the import path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Server"))
 
 # ---------------------------------------------------------------------------
 # Colours

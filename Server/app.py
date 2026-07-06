@@ -1173,13 +1173,27 @@ class App:
 
         # Launch TUI or wait
         if not self.no_tui:
-            from tui import TUI
-            self.tui = TUI(self)
-            print("Starting TUI... (press 'q' to quit)")
             try:
-                self.tui.run()
-            finally:
-                self.stop()
+                from tui import TUI
+                self.tui = TUI(self)
+            except (ImportError, ModuleNotFoundError) as e:
+                print(f"TUI not available ({e}). Falling back to headless mode.")
+                self.tui = None
+
+            if self.tui:
+                print("Starting TUI... (press 'q' to quit)")
+                try:
+                    self.tui.run()
+                finally:
+                    self.stop()
+            else:
+                try:
+                    while self.scheduler.running:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    self.stop()
         else:
             try:
                 while self.scheduler.running:

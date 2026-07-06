@@ -1,3 +1,4 @@
 data*/
 .venv/
-__pucache__/
+__pycache__/
+

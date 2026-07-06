@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Decentralised Web</title>
+    <title>KNet</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <!-- Title Bar -->
     <div class="title-bar">
         <div class="title-bar-left">
-            <span class="network-name" id="networkName">Decentralised Web</span>
+            <span class="network-name" id="networkName">KNet</span>
             <span class="author-name" id="authorName"></span>
             <button class="btn btn-ghost" id="shareNetworkBtn">Share Network</button>
         </div>
@@ -28,7 +28,7 @@
                 <button class="btn btn-ghost" id="hideSidePanel">✕</button>
             </div>
             <div class="qr-container" id="qrContainer">
-                <canvas id="qrCanvas"></canvas>
+                <img id="qrImage" alt="QR Code" class="qr-image">
             </div>
             <div class="side-panel-actions">
                 <button class="btn btn-primary" id="copyLinkBtn">📋 Copy Link</button>

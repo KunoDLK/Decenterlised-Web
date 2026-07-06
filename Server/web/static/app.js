@@ -40,7 +40,26 @@ async function init() {
     await loadPeers();
     await loadStorage();
     await loadNetworkName();
+    await loadQR();
     renderAll();
+
+    // Handle join link: ?join=<node_id>&pk=<pubkey>&addr=<ip:port>
+    const params = new URLSearchParams(location.search);
+    const joinId = params.get('join');
+    const joinPk = params.get('pk');
+    const joinAddr = params.get('addr');
+    if (joinId && joinPk && joinAddr) {
+        const url = `decentralised://?join=${joinId}&pk=${joinPk}&addr=${joinAddr}`;
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify({ type: 'connect_peer', url }));
+        } else {
+            state.ws.addEventListener('open', () => {
+                state.ws.send(JSON.stringify({ type: 'connect_peer', url }));
+            }, { once: true });
+        }
+        // Clean URL
+        history.replaceState(null, '', location.pathname);
+    }
 }
 
 function connectWebSocket() {
@@ -546,46 +565,10 @@ async function loadQR() {
     try {
         const resp = await fetch('/api/qr');
         const data = await resp.json();
-        const canvas = document.getElementById('qrCanvas');
-        const size = 200;
-        const gridSize = 21;
-        const moduleSize = Math.floor(size / (gridSize + 8));
-        const offset = 4 * moduleSize;
-
-        canvas.width = size;
-        canvas.height = size;
-        const ctx = canvas.getContext('2d');
-
-        // White background
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, size, size);
-
-        // Generate a deterministic grid pattern from the URL string
-        const url = data.url || '';
-        let hash = 0;
-        for (let i = 0; i < url.length; i++) {
-            hash = ((hash << 5) - hash) + url.charCodeAt(i);
-            hash |= 0;
-        }
-
-        // Draw grid
-        ctx.fillStyle = '#000000';
-        for (let row = 0; row < gridSize; row++) {
-            for (let col = 0; col < gridSize; col++) {
-                const seed = Math.abs(hash + row * 31 + col * 17) % 100;
-                // Finder patterns in corners
-                const isFinder = (row < 7 && col < 7) || (row < 7 && col >= gridSize - 7) || (row >= gridSize - 7 && col < 7);
-                const isFinderBorder = (row === 0 || row === 6 || col === 0 || col === 6) && 
-                    ((row < 7 && col < 7) || (row < 7 && col >= gridSize - 7) || (row >= gridSize - 7 && col < 7));
-                const isFinderInner = (row >= 2 && row <= 4 && col >= 2 && col <= 4) &&
-                    ((row < 7 && col < 7) || (row < 7 && col >= gridSize - 7) || (row >= gridSize - 7 && col < 7));
-                
-                if (isFinderBorder || isFinderInner || (!isFinder && seed < 45)) {
-                    const x = offset + col * moduleSize;
-                    const y = offset + row * moduleSize;
-                    ctx.fillRect(x, y, moduleSize, moduleSize);
-                }
-            }
+        const img = document.getElementById('qrImage');
+        if (data.qr_data_url) {
+            img.src = data.qr_data_url;
+            img.style.display = 'block';
         }
     } catch (e) {}
 }

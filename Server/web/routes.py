@@ -41,16 +41,25 @@ def login_required(f):
 
 @main.route("/")
 def index():
-    """Serve index.html if authenticated, else redirect to login."""
+    """Serve index.html if authenticated, else redirect to login (preserving join params)."""
     if not session.get("authenticated"):
-        return redirect(url_for("main.login_page"))
+        qs = request.query_string.decode("utf-8")
+        target = url_for("main.login_page")
+        if qs:
+            target += "?" + qs
+        return redirect(target)
     return render_template("index.html")
 
 
 @main.route("/login")
 def login_page():
     """Serve login page."""
-    return render_template("login.html")
+    # Preserve join/pk/addr params from referrer so they survive the login flow
+    join_id = request.args.get("join", "")
+    join_pk = request.args.get("pk", "")
+    join_addr = request.args.get("addr", "")
+    return render_template("login.html",
+                          join_id=join_id, join_pk=join_pk, join_addr=join_addr)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +392,7 @@ def api_network_name():
     config_path = __import__("os").path.join(node.data_dir, "config.json")
 
     if request.method == "GET":
-        name = "Decentralised Web"
+        name = "KNet"
         if __import__("os").path.exists(config_path):
             with open(config_path, "r") as f:
                 config = json.load(f)
@@ -413,12 +422,26 @@ def api_network_name():
 @main.route("/api/qr")
 @login_required
 def api_qr():
-    """Return connection URL for this node."""
+    """Return connection URL for this node with a real QR code (PNG data URL)."""
+    import base64
+    import io
+    import socket
+    import qrcode
     from flask import current_app
 
     node = current_app.config["node"]
     web_port = current_app.config.get("web_port", 9001)
     web_host = current_app.config.get("web_host", "127.0.0.1")
+
+    # Auto-detect LAN IP if web_host is localhost (required for QR to work on other devices)
+    if web_host in ("127.0.0.1", "localhost", "0.0.0.0", "::1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            web_host = s.getsockname()[0]
+            s.close()
+        except OSError:
+            pass  # fall back to 127.0.0.1
 
     pk_b64 = __import__("identity").public_key_to_base64(
         node.node_identity.public_key_bytes
@@ -429,7 +452,22 @@ def api_qr():
         f"pk={pk_b64}&"
         f"addr={node.udp_engine.public_ip}:{node.udp_engine.public_port}"
     )
-    return jsonify({"url": url})
+
+    # Generate real QR code as PNG data URL
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+    return jsonify({"url": url, "qr_data_url": qr_data_url})
 
 
 # ---------------------------------------------------------------------------

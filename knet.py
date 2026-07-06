@@ -102,7 +102,7 @@ def main():
     # ── Launch the main application ────────────────────────────────────
     os.chdir(PROJECT_ROOT)
     sys.stdout.flush()
-    subprocess.run([python_exe, MAIN_APP])
+    subprocess.run([python_exe, MAIN_APP] + sys.argv[1:])
 
 
 if __name__ == "__main__":

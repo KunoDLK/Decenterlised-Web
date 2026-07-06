@@ -61,8 +61,8 @@ def get_public_address(
     Raises:
         StunError: If all STUN servers timeout or return malformed responses.
     """
-    # Build RFC 5389 Binding Request
-    transaction_id = os.urandom(16)
+    # Build RFC 5389 Binding Request (20-byte header)
+    transaction_id = os.urandom(12)  # 96-bit STUN transaction ID
     request = _build_binding_request(transaction_id)
 
     original_timeout = sock.gettimeout()
@@ -98,13 +98,13 @@ def get_public_address(
 
 
 def _build_binding_request(transaction_id: bytes) -> bytes:
-    """Build STUN Binding Request (20-byte header)."""
+    """Build STUN Binding Request (20-byte header: 2B type + 2B len + 4B magic + 12B tid)."""
     return struct.pack(
-        ">H H 4s 8s",
-        BINDING_REQUEST,  # message type
-        0,  # message length (no attributes)
-        struct.pack(">I", MAGIC_COOKIE),  # magic cookie
-        transaction_id,  # 12 bytes after cookie = full 16-byte ID
+        ">H H 4s 12s",
+        BINDING_REQUEST,         # message type (2 bytes)
+        0,                       # message length — no attributes (2 bytes)
+        struct.pack(">I", MAGIC_COOKIE),  # magic cookie (4 bytes)
+        transaction_id,          # transaction ID (12 bytes)
     )
 
 
@@ -118,8 +118,8 @@ def _parse_binding_response(
     if len(data) < 20:
         return None
 
-    msg_type, msg_len, magic_cookie_bytes, tid_rest = struct.unpack(
-        ">H H 4s 8s", data[:16]
+    msg_type, msg_len, magic_cookie_bytes, tid_received = struct.unpack(
+        ">H H 4s 12s", data[:20]
     )
 
     # Verify it's a Binding Success Response
@@ -131,9 +131,8 @@ def _parse_binding_response(
     if magic != MAGIC_COOKIE:
         return None
 
-    # Verify transaction ID
-    received_tid = magic_cookie_bytes + tid_rest
-    if received_tid != expected_tid:
+    # Verify transaction ID (12 bytes)
+    if tid_received != expected_tid:
         return None
 
     # Parse attributes

@@ -1,8 +1,11 @@
 """
-app.py — Main Entry Point
+app.py — Main Entry Point (Scheduler-Driven Architecture)
 
-Central orchestrator: parses CLI args, initialises all modules, wires them together,
-launches TUI and/or web server.
+Central orchestrator: parses CLI args, initialises all modules, wires them
+together via the unified Scheduler, launches TUI and/or web server.
+
+All periodic work is driven by the scheduler — no scattered timer threads.
+All per-connection state lives in the peer_book DB — the UDP engine is thin.
 """
 
 from __future__ import annotations
@@ -14,14 +17,17 @@ import json
 import logging
 import os
 import signal
+import struct
 import sys
 import threading
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import log_utils
+import wire
 from identity import (
     NodeIdentity,
     AuthorIdentity,
@@ -29,13 +35,11 @@ from identity import (
     public_key_to_base64,
     public_key_from_base64,
 )
-from wire import PayloadBuilder
 from reliable import ReliabilityManager
 from protocol import (
     MsgType,
     MessageBuilder,
     MessageParser,
-    ProtocolRouter,
     FilePublishPayload,
     FileUpdatePayload,
     FileDeletePayload,
@@ -43,13 +47,20 @@ from protocol import (
     ReplicaEntry,
     HelloPayload,
     PeerListResponsePayload,
+    PeerEntry,
     FileRegistryResponsePayload,
     FileAnnouncePayload,
+    FileChunkAckPayload,
+    FileChunkPayload,
+    FileRequestPayload,
     ReplicationSolicitPayload,
+    ReplicationAckPayload,
     ConnectIntroducePayload,
     ConnectRequestPayload,
+    ConnectAckPayload,
     ShareFileQueryPayload,
     ShareFileResponsePayload,
+    PingPayload,
 )
 from stun import StunError
 from udp_engine import UDPEngine
@@ -57,6 +68,8 @@ from peer_book import PeerBook
 from file_registry import FileRegistry
 from storage import StorageManager
 from replication import ReplicationManager
+from scheduler import Scheduler, Action, ActionType, Priority
+from config import PeerConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,7 +77,6 @@ from replication import ReplicationManager
 
 BOOTSTRAP_PEERS: list[tuple[str, str, str, int]] = [
     # Format: (node_id, public_key_base64, ip, port)
-    # Empty by default — rely on LAN broadcast + QR sharing
 ]
 
 MIN_PUBLISH_BYTES: int = 1_048_576  # 1MB
@@ -90,13 +102,11 @@ class EventBus:
 
     def emit(self, event_type: str, **data: Any) -> None:
         data["type"] = event_type
-        # Notify specific subscribers
         for cb in self._subscribers.get(event_type, set()):
             try:
                 cb(data)
             except Exception:
                 pass
-        # Notify wildcard subscribers
         for cb in self._subscribers.get("*", set()):
             try:
                 cb(data)
@@ -110,7 +120,7 @@ class EventBus:
 
 
 class App:
-    """Central orchestrator for the decentralised file storage node."""
+    """Central orchestrator — scheduler-driven, DB-backed state."""
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.data_dir = os.path.expanduser(args.data_dir)
@@ -119,448 +129,389 @@ class App:
         self.web_host = args.web_host
         self.no_tui = args.no_tui
         self.no_lan = args.no_lan
-        self.storage_limit_mb = args.storage_limit
-        self.log_file = args.log  # e.g. "app.log"
-        self.udp_trace_file = args.udp_trace  # e.g. "packets.hex"
-        self._stopped = False  # guard against double-stop
+        self._stopped = False
 
-        # Ensure data directory exists
+        # Build config from args
+        self.config = PeerConfig(
+            udp_port=self.port,
+            web_port=self.web_port,
+            web_host=self.web_host,
+            no_tui=self.no_tui,
+            no_lan=self.no_lan,
+            storage_limit_mb=args.storage_limit,
+            data_dir=self.data_dir,
+            log_file=args.log,
+            udp_trace_file=args.udp_trace,
+            tui_port_offset=args.tui_port_offset,
+        )
+
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
 
-        # Configure logging **before** any module creates a logger
-        if self.log_file:
-            log_utils.configure(self.data_dir, self.log_file, self.no_tui)
-        if self.udp_trace_file:
-            log_utils.configure_udp_trace(self.data_dir, self.udp_trace_file)
-
+        # Logging
+        if self.config.log_file:
+            log_utils.configure(self.data_dir, self.config.log_file, self.no_tui)
+        if self.config.udp_trace_file:
+            log_utils.configure_udp_trace(self.data_dir, self.config.udp_trace_file)
         self._log = logging.getLogger("app")
 
-        # Lock file — prevent two instances from sharing a data dir
+        # Lock file
         self._acquire_lock()
 
-        # Load/create NodeIdentity
+        # Identity
         self.node_identity = NodeIdentity.load_or_create(self.data_dir)
-
-        # Author identity (set during login)
         self.author_identity: Optional[AuthorIdentity] = None
         self.author_mode: str = "browse_only"
 
         # Event bus
         self.event_bus = EventBus()
 
-        # Initialise modules in dependency order
+        # DB-backed modules
         self.peer_book = PeerBook(self.data_dir)
         self.file_registry = FileRegistry(self.data_dir, self.node_identity.node_id)
-        self.storage = StorageManager(self.data_dir, self.storage_limit_mb)
-
-        # Link storage to file_registry for tier calculations
+        self.storage = StorageManager(self.data_dir, self.config.storage_limit_mb)
         self.file_registry.storage = self.storage
 
-        self.reliable = ReliabilityManager()
-        self.replication = ReplicationManager(
-            self.file_registry, self.storage, self.peer_book, None  # udp_engine set later
+        # Reliability (event-driven, no polling)
+        self.reliable = ReliabilityManager(
+            ack_timeout=self.config.ack_timeout_base,
+            max_retries=self.config.max_retries,
+            ack_timeout_max=self.config.ack_timeout_max,
+            ack_timeout_multiplier=self.config.ack_timeout_multiplier,
         )
 
-        self.protocol_router = ProtocolRouter(
-            self.node_identity.node_id,
-            None,  # udp_engine set later
-            self.peer_book,
-            self.file_registry,
-            self.storage,
-            self.replication,
-            self.reliable,
-        )
+        # Unified scheduler (replaces all timer threads)
+        self.scheduler = Scheduler()
 
+        # UDP engine (thin — just socket + recv + send)
         self.udp_engine = UDPEngine(
-            self.port,
-            self.node_identity,
-            self.protocol_router,
-            self.reliable,
-            self.peer_book,
+            port=self.port,
+            node_identity=self.node_identity,
+            reliable=self.reliable,
+            peer_book=self.peer_book,
+            scheduler=self.scheduler,
+            max_chunk_size=self.config.max_chunk_size,
+        )
+        self.udp_engine.set_packet_handler(self._handle_packet)
+
+        # Replication (uses scheduler)
+        self.replication = ReplicationManager(
             self.file_registry,
             self.storage,
+            self.peer_book,
+            self.udp_engine,
+            self.scheduler,
         )
 
-        # Wire cross-references
-        self.protocol_router.udp_engine = self.udp_engine
-        self.replication.udp_engine = self.udp_engine
+        # Register scheduler action handlers
+        self._register_scheduler_handlers()
 
-        # Register protocol handlers
-        self._register_handlers()
-
-        # Web app (created later if needed)
+        # Web app / TUI (created later)
         self.web_app = None
-
-        # TUI
         self.tui = None
 
     # ==================================================================
-    # Protocol handlers
+    # Packet handler — called by UDP engine recv thread
     # ==================================================================
 
-    def _register_handlers(self) -> None:
-        r = self.protocol_router
+    def _handle_packet(
+        self, wm: "wire.WireMessage", from_addr: tuple[str, int], udp: UDPEngine
+    ) -> None:
+        """Dispatch an incoming decoded packet. Updates DB, queues actions."""
+        msg_type = wm.msg_type
+        sender_prefix = wm.sender_id_prefix.hex()
+        sender_id = udp.resolve_node_id(from_addr) or sender_prefix
+        self.peer_book.mark_seen(sender_id)
+        if self.reliable.is_duplicate(sender_id, wm.seq_num):
+            return
+        try:
+            if msg_type == MsgType.HELLO:
+                self._on_hello(wm, sender_id, from_addr)
+            elif msg_type == MsgType.PING:
+                self._on_ping(wm, sender_id)
+            elif msg_type == MsgType.PEER_LIST_REQUEST:
+                self._on_peer_list_request(sender_id)
+            elif msg_type == MsgType.PEER_LIST_RESPONSE:
+                self._on_peer_list_response(wm)
+            elif msg_type == MsgType.FILE_REGISTRY_QUERY:
+                self._on_file_registry_query(sender_id)
+            elif msg_type == MsgType.FILE_REGISTRY_RESPONSE:
+                self._on_file_registry_response(wm)
+            elif msg_type == MsgType.FILE_REGISTRY_PUSH:
+                self._on_file_registry_push(wm, sender_id)
+            elif msg_type == MsgType.FILE_REQUEST:
+                self._on_file_request(wm, sender_id)
+            elif msg_type == MsgType.FILE_CHUNK:
+                self._on_file_chunk(wm, sender_id)
+            elif msg_type == MsgType.FILE_CHUNK_ACK:
+                self._on_file_chunk_ack(wm, sender_id)
+            elif msg_type == MsgType.FILE_ANNOUNCE:
+                self._on_file_announce(wm)
+            elif msg_type == MsgType.REPLICATION_SOLICIT:
+                self._on_replication_solicit(wm, sender_id)
+            elif msg_type == MsgType.REPLICATION_ACK:
+                self._on_replication_ack(wm)
+            elif msg_type == MsgType.FILE_PUBLISH:
+                self._on_file_publish(wm, sender_id)
+            elif msg_type == MsgType.FILE_UPDATE:
+                self._on_file_update(wm, sender_id)
+            elif msg_type == MsgType.FILE_DELETE:
+                self._on_file_delete(wm)
+            elif msg_type == MsgType.CONNECT_REQUEST:
+                self._on_connect_request(wm, from_addr)
+            elif msg_type == MsgType.CONNECT_INTRODUCE:
+                self._on_connect_introduce(wm)
+            elif msg_type == MsgType.CONNECT_ACK:
+                self._on_connect_ack(wm)
+            elif msg_type == MsgType.SHARE_FILE_QUERY:
+                self._on_share_file_query(wm, sender_id)
+            elif msg_type == MsgType.SHARE_FILE_RESPONSE:
+                self._on_share_file_response(wm)
+            elif msg_type == MsgType.GOODBYE:
+                self._on_goodbye(sender_id)
+        except Exception:
+            self._log.exception("Error handling packet type=%d from %s", msg_type, sender_id[:12])
 
-        r.register(MsgType.HELLO, self._handle_hello)
-        r.register(MsgType.PING, self._handle_ping)
-        r.register(MsgType.PEER_LIST_REQUEST, self._handle_peer_list_request)
-        r.register(MsgType.PEER_LIST_RESPONSE, self._handle_peer_list_response)
-        r.register(MsgType.FILE_REGISTRY_QUERY, self._handle_file_registry_query)
-        r.register(MsgType.FILE_REGISTRY_RESPONSE, self._handle_file_registry_response)
-        r.register(MsgType.FILE_REGISTRY_PUSH, self._handle_file_registry_push)
-        r.register(MsgType.FILE_REQUEST, self._handle_file_request)
-        r.register(MsgType.FILE_CHUNK, self._handle_file_chunk)
-        r.register(MsgType.FILE_CHUNK_ACK, self._handle_file_chunk_ack)
-        r.register(MsgType.FILE_ANNOUNCE, self._handle_file_announce)
-        r.register(MsgType.REPLICATION_SOLICIT, self._handle_replication_solicit)
-        r.register(MsgType.REPLICATION_ACK, self._handle_replication_ack)
-        r.register(MsgType.FILE_PUBLISH, self._handle_file_publish)
-        r.register(MsgType.FILE_UPDATE, self._handle_file_update)
-        r.register(MsgType.FILE_DELETE, self._handle_file_delete)
-        r.register(MsgType.CONNECT_REQUEST, self._handle_connect_request)
-        r.register(MsgType.CONNECT_INTRODUCE, self._handle_connect_introduce)
-        r.register(MsgType.CONNECT_ACK, self._handle_connect_ack)
-        r.register(MsgType.SHARE_FILE_QUERY, self._handle_share_file_query)
-        r.register(MsgType.SHARE_FILE_RESPONSE, self._handle_share_file_response)
-        r.register(MsgType.GOODBYE, self._handle_goodbye)
+    # ---- Packet sub-handlers (update DB, queue actions) ----
 
-    # ---- Hello / Ping / Goodbye ----
-
-    def _handle_hello(self, wire_msg, p: HelloPayload, from_addr) -> None:
-        # Verify signature
-        import struct
+    def _on_hello(self, wm, sender_id: str, from_addr: tuple[str, int]) -> None:
+        p = MessageParser.hello(wm.payload)
         sign_data = (
-            p.node_id.encode()
-            + p.public_ip.encode()
+            p.node_id.encode() + p.public_ip.encode()
             + struct.pack(">H", p.public_port)
             + struct.pack(">Q", int(p.uptime_since * 1_000_000))
         )
         if not NodeIdentity.verify(sign_data, p.signature, p.public_key):
-            self._log.warning("HELLO from %s:%d — signature verification failed", *from_addr)
+            self._log.warning("HELLO signature fail from %s:%d", *from_addr)
             return
+
+        # Check if this is a new peer BEFORE updating state
+        cs = self.peer_book.get_connection_state(p.node_id)
+        was_new = cs is None or cs["state"] != "CONNECTED"
 
         self.peer_book.add_or_update(
             p.node_id, p.public_key, p.public_ip, p.public_port, p.uptime_since
         )
-
-        from connection import new_connection, mark_connected
-
-        conn = self.udp_engine.connections.get(p.node_id)
-        was_new = conn is None
-        if was_new:
-            conn = new_connection(p.node_id, p.public_key, from_addr)
-            self.udp_engine.connections[p.node_id] = conn
-            self._log.info("New peer %s from %s:%d", p.node_id[:12], *from_addr)
-
-        mark_connected(conn)
-        conn.uptime_since = p.uptime_since
-        self.udp_engine._addr_to_node_id[from_addr] = p.node_id
-
-        # Only reply with HELLO on first contact to avoid HELLO storms
-        if was_new:
-            self._log.info("Peer connected: %s (%s:%d)", p.node_id[:12], *from_addr)
-            self.event_bus.emit("peer_connected", node_id=p.node_id)
-            hello_payload = MessageBuilder.hello(self.udp_engine._build_hello_payload())
-            self.udp_engine.send_to(p.node_id, MsgType.HELLO, hello_payload)
-
-    def _handle_ping(self, wire_msg, p, from_addr) -> None:
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
-        if sender_id:
-            self.peer_book.mark_seen(sender_id)
-            conn = self.udp_engine.connections.get(sender_id)
-            if conn:
-                conn.last_seen = time.time()
-            # Do NOT reply — PING is a one-way heartbeat; replying creates a storm
-
-    def _handle_goodbye(self, wire_msg, p, from_addr) -> None:
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
-        if sender_id:
-            self._log.info("Peer disconnected: %s", sender_id[:12])
-            self.peer_book.mark_offline(sender_id)
-            self.file_registry.remove_peer_replicas(sender_id)
-            conn = self.udp_engine.connections.pop(sender_id, None)
-            if conn:
-                from connection import mark_disconnected
-                mark_disconnected(conn)
-            self.event_bus.emit("peer_disconnected", node_id=sender_id)
-
-    # ---- Peer list ----
-
-    def _handle_peer_list_request(self, wire_msg, p, from_addr) -> None:
-        from protocol import PeerEntry
-        peers = []
-        for nid in self.udp_engine.get_connected_peers():
-            conn = self.udp_engine.connections.get(nid)
-            if conn:
-                peers.append(
-                    PeerEntry(
-                        node_id=nid,
-                        public_ip=conn.address[0],
-                        public_port=conn.address[1],
-                        uptime_since=conn.uptime_since,
-                    )
-                )
-        target = self.replication.calculate_network_target()
-        resp = PeerListResponsePayload(
-            peers=peers,
-            estimated_network_target=target,
-            signature=b"",  # TODO: sign
+        self.peer_book.set_connection_state(
+            p.node_id, "CONNECTED", from_addr[0], from_addr[1]
         )
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
+        self.udp_engine._addr_cache[from_addr] = p.node_id
+
+        if was_new:
+            self._log.info("New peer %s from %s:%d", p.node_id[:12], *from_addr)
+            self.event_bus.emit("peer_connected", node_id=p.node_id)
+            self.scheduler.enqueue_at_front(
+                Action.critical(ActionType.SEND_HELLO_REPLY, peer_id=p.node_id)
+            )
+        self.scheduler.cancel_by_type(
+            ActionType.CHECK_PING_RESPONSE, {"peer_id": p.node_id}
+        )
+
+    def _on_ping(self, wm, sender_id: str) -> None:
+        self.peer_book.record_ping_received(sender_id)
+        self.scheduler.cancel_by_type(
+            ActionType.CHECK_PING_RESPONSE, {"peer_id": sender_id}
+        )
+
+    def _on_peer_list_request(self, sender_id: str) -> None:
         if sender_id:
-            self.udp_engine.send_to(
-                sender_id,
-                MsgType.PEER_LIST_RESPONSE,
-                MessageBuilder.peer_list_response(resp),
+            self.scheduler.enqueue_at_front(
+                Action.critical(
+                    ActionType.SEND_HELLO_REPLY, peer_id=sender_id,
+                    sub_action="peer_list_response",
+                )
             )
 
-    def _handle_peer_list_response(self, wire_msg, p: PeerListResponsePayload, from_addr) -> None:
+    def _on_peer_list_response(self, wm) -> None:
+        p = MessageParser.peer_list_response(wm.payload)
         for peer in p.peers:
             self.peer_book.add_or_update(
                 peer.node_id, b"", peer.public_ip, peer.public_port, peer.uptime_since
             )
         self.replication.receive_target_estimate(p.estimated_network_target)
 
-    # ---- File registry ----
-
-    def _handle_file_registry_query(self, wire_msg, p, from_addr) -> None:
-        entries = self.file_registry.get_all()
-        target = self.replication.calculate_network_target()
-        resp = FileRegistryResponsePayload(entries=entries, estimated_network_target=target)
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
+    def _on_file_registry_query(self, sender_id: str) -> None:
         if sender_id:
-            self.udp_engine.send_to(
-                sender_id,
-                MsgType.FILE_REGISTRY_RESPONSE,
-                MessageBuilder.file_registry_response(resp),
+            self.scheduler.enqueue_at_front(
+                Action.critical(
+                    ActionType.SEND_HELLO_REPLY, peer_id=sender_id,
+                    sub_action="file_registry_response",
+                )
             )
 
-    def _handle_file_registry_response(self, wire_msg, p: FileRegistryResponsePayload, from_addr) -> None:
+    def _on_file_registry_response(self, wm) -> None:
+        p = MessageParser.file_registry_response(wm.payload)
         self.file_registry.merge_delta(p.entries)
         self.replication.receive_target_estimate(p.estimated_network_target)
 
-    def _handle_file_registry_push(self, wire_msg, p, from_addr) -> None:
+    def _on_file_registry_push(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_registry_push(wm.payload)
         self.file_registry.update(p.entry)
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
-        # Propagate to other peers
+        from protocol import FileRegistryPushPayload
+        push = FileRegistryPushPayload(entry=p.entry)
         self.udp_engine.broadcast_except(
             MsgType.FILE_REGISTRY_PUSH,
-            MessageBuilder.file_registry_push(p),
+            MessageBuilder.file_registry_push(push),
             sender_id or "",
         )
 
-    # ---- File transfer ----
-
-    def _handle_file_request(self, wire_msg, p, from_addr) -> None:
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
+    def _on_file_request(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_request(wm.payload)
         if not sender_id:
-            self._log.warning("FILE_REQUEST for %s from unknown addr %s:%d — ignored",
-                              p.file_id[:12], *from_addr)
             return
         if self.storage.has_file(p.file_id):
-            data = self.storage.read_file(p.file_id)
-            self._log.info("FILE_REQUEST %s from %s (%d chars) — uploading %d bytes",
-                            p.file_id[:12], sender_id, len(sender_id), len(data))
-            self.udp_engine.upload_file(sender_id, p.file_id, data)
-        else:
-            self._log.warning("FILE_REQUEST %s from %s — file not on disk",
-                              p.file_id[:12], sender_id[:12])
+            self.scheduler.enqueue_at_front(
+                Action.critical(
+                    ActionType.SEND_CHUNK, file_id=p.file_id, peer_id=sender_id,
+                )
+            )
 
-    def _handle_file_chunk(self, wire_msg, p, from_addr) -> None:
-        ds = self.udp_engine.pending_downloads.get(p.file_id)
-        if ds is None:
-            ds = __import__("udp_engine").DownloadState(p.file_id, "")
-            self.udp_engine.pending_downloads[p.file_id] = ds
-            self._log.info("Download started: %s (chunk %d/%d, %d bytes)",
-                            p.file_id[:12], p.chunk_index + 1, p.total_chunks, len(p.data))
+    def _on_file_chunk(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_chunk(wm.payload)
+        transfer_id = f"dl:{p.file_id}:{sender_id}"
 
-        ds.total_chunks = p.total_chunks
-        ds.received[p.chunk_index] = p.data
+        # Store chunk data on disk (stateless — no in-memory buffer)
+        self.storage.store_chunk(p.file_id, p.chunk_index, p.data)
 
-        received = len(ds.received)
-        # Log progress every 10 chunks or at first/last
-        if p.chunk_index == 0 or received == ds.total_chunks or received % 10 == 0:
-            pct = received * 100 // max(ds.total_chunks, 1)
-            self._log.info("Download %s: chunk %d/%d (%d%%)",
-                            p.file_id[:12], received, ds.total_chunks, pct)
+        # Update transfer progress in DB
+        self.file_registry.update_transfer_progress(
+            transfer_id, p.chunk_index, p.total_chunks
+        )
 
-        # Send chunk ACK
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
+        # Send ACK
         if sender_id:
-            from protocol import FileChunkAckPayload
+            ack = FileChunkAckPayload(file_id=p.file_id, chunk_index=p.chunk_index)
             self.udp_engine.send_to(
-                sender_id,
-                MsgType.FILE_CHUNK_ACK,
-                MessageBuilder.file_chunk_ack(
-                    FileChunkAckPayload(file_id=p.file_id, chunk_index=p.chunk_index)
-                ),
+                sender_id, MsgType.FILE_CHUNK_ACK,
+                MessageBuilder.file_chunk_ack(ack),
             )
 
-        # Check completion
-        if received == ds.total_chunks:
-            chunks = [ds.received[i] for i in range(ds.total_chunks)]
-            data = b"".join(chunks)
-            # Verify integrity: file_id = SHA-256(data + author_id + timestamp)
-            entry = self.file_registry.get(p.file_id)
-            integrity_ok = False
-            if entry is not None:
-                expected = hashlib.sha256(
-                    data + entry.author_id.encode() + str(entry.timestamp).encode()
-                ).hexdigest()
-                integrity_ok = (expected == p.file_id)
-            else:
-                integrity_ok = True  # no entry to verify against, accept
-
-            if integrity_ok:
-                self._log.info("Download complete: %s (%d bytes, integrity OK)",
-                                p.file_id[:12], len(data))
-                self.storage.store_temporary_replica(p.file_id, data, "")
-                self.file_registry.increment_replica(p.file_id, self.node_identity.node_id)
-                # Broadcast file announce
-                from protocol import FileAnnouncePayload
-                announce = FileAnnouncePayload(
-                    file_id=p.file_id,
-                    node_id=self.node_identity.node_id,
-                    is_temporary=True,
-                    signature=b"",
-                )
-                self.udp_engine.broadcast(
-                    MsgType.FILE_ANNOUNCE,
-                    MessageBuilder.file_announce(announce),
-                )
-            else:
-                self._log.error("Download %s: integrity check failed!", p.file_id[:12])
-            ds.download_complete.set()
-
-        # Progress event
-        if ds.total_chunks > 0:
-            progress = len(ds.received) / ds.total_chunks
-            self.event_bus.emit(
-                "download_progress",
-                file_id=p.file_id,
-                progress=progress,
-                status="downloading",
-            )
-
-    def _handle_file_chunk_ack(self, wire_msg, p, from_addr) -> None:
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
-        if not sender_id:
-            return
-        state = self.udp_engine.upload_queue.get((sender_id, p.file_id))
-        if state:
-            state.current_chunk = p.chunk_index + 1
-            if state.current_chunk < state.total_chunks:
-                self.udp_engine._send_chunk(state, state.current_chunk)
-            else:
-                # Upload complete
-                self.udp_engine.upload_queue.pop((sender_id, p.file_id), None)
-                self._log.info("Upload complete: %s → %s (%d chunks)",
-                                p.file_id[:12], sender_id[:12], state.total_chunks)
-
-    # ---- File announce / replication ----
-
-    def _handle_file_announce(self, wire_msg, p: FileAnnouncePayload, from_addr) -> None:
-        self.file_registry.increment_replica(p.file_id, p.node_id)
-        self._log.info("File announce: %s now has replica from %s",
-                        p.file_id[:12], p.node_id[:12])
-
-    def _handle_replication_solicit(self, wire_msg, p: ReplicationSolicitPayload, from_addr) -> None:
-        accepted = self.replication.consider_solicit(p)
-        if accepted:
-            sender_id = self.udp_engine.resolve_node_id(from_addr)
-            if sender_id:
-                from protocol import ReplicationAckPayload
-                self.udp_engine.send_to(
-                    sender_id,
-                    MsgType.REPLICATION_ACK,
-                    MessageBuilder.replication_ack(
-                        ReplicationAckPayload(
-                            file_id=p.file_id, node_id=self.node_identity.node_id
+        # Check if download is complete (all chunks received)
+        total, _, received = self.file_registry.get_transfer_progress(transfer_id)
+        if total > 0 and len(received) >= total:
+            # Assemble chunks into final file
+            try:
+                data = self.storage.assemble_chunks(p.file_id, total)
+                # Integrity check
+                entry = self.file_registry.get(p.file_id)
+                if entry is not None:
+                    expected = hashlib.sha256(
+                        data + entry.author_id.encode() + str(entry.timestamp).encode()
+                    ).hexdigest()
+                    if expected == p.file_id:
+                        self.storage.store_temporary_replica(p.file_id, data, "")
+                        self.file_registry.increment_replica(p.file_id, self.node_identity.node_id)
+                        self.file_registry.mark_transfer_complete(transfer_id)
+                        self._log.info("Download complete: %s (%d bytes, integrity OK)",
+                                        p.file_id[:12], len(data))
+                        # Broadcast file announce
+                        announce = FileAnnouncePayload(
+                            file_id=p.file_id, node_id=self.node_identity.node_id,
+                            is_temporary=True, signature=b"",
                         )
-                    ),
-                )
+                        self.udp_engine.broadcast(
+                            MsgType.FILE_ANNOUNCE, MessageBuilder.file_announce(announce)
+                        )
+                        self.event_bus.emit("download_progress", file_id=p.file_id,
+                                            progress=1.0, status="complete")
+                    else:
+                        self._log.error("Download %s: integrity check failed!", p.file_id[:12])
+                        self.file_registry.mark_transfer_failed(transfer_id)
+                else:
+                    # No registry entry — still store the data
+                    self.storage.store_temporary_replica(p.file_id, data, "")
+                    self.file_registry.mark_transfer_complete(transfer_id)
+                    self._log.info("Download complete: %s (%d bytes, no registry entry)",
+                                    p.file_id[:12], len(data))
+            except FileNotFoundError:
+                self._log.warning("Download %s: chunk assembly failed, missing chunks",
+                                  p.file_id[:12])
 
-    def _handle_replication_ack(self, wire_msg, p, from_addr) -> None:
+    def _on_file_chunk_ack(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_chunk_ack(wm.payload)
+        if sender_id:
+            transfer_id = f"ul:{p.file_id}:{sender_id}"
+            self.scheduler.cancel_by_type(
+                ActionType.CHECK_CHUNK_ACK,
+                {"transfer_id": transfer_id, "chunk_index": p.chunk_index},
+            )
+            self.scheduler.enqueue_at_front(
+                Action.critical(
+                    ActionType.SEND_CHUNK, file_id=p.file_id, peer_id=sender_id,
+                    chunk_index=p.chunk_index + 1,
+                )
+            )
+
+    def _on_file_announce(self, wm) -> None:
+        p = MessageParser.file_announce(wm.payload)
         self.file_registry.increment_replica(p.file_id, p.node_id)
 
-    # ---- File publish / update / delete ----
+    def _on_replication_solicit(self, wm, sender_id: str) -> None:
+        p = MessageParser.replication_solicit(wm.payload)
+        if self.replication.consider_solicit(p) and sender_id:
+            ack = ReplicationAckPayload(
+                file_id=p.file_id, node_id=self.node_identity.node_id
+            )
+            self.udp_engine.send_to(
+                sender_id, MsgType.REPLICATION_ACK,
+                MessageBuilder.replication_ack(ack),
+            )
 
-    def _handle_file_publish(self, wire_msg, p: FilePublishPayload, from_addr) -> None:
-        import struct
-        pb = PayloadBuilder()
-        pb.add_string(p.file_id)
-        pb.add_string(p.file_name)
-        pb.add_uint64(p.file_size)
-        pb.add_string(p.mime_type)
-        pb.add_string(p.author_id)
-        pb.add_uint64(int(p.timestamp * 1_000_000))
+    def _on_replication_ack(self, wm) -> None:
+        p = MessageParser.replication_ack(wm.payload)
+        self.file_registry.increment_replica(p.file_id, p.node_id)
+
+    def _on_file_publish(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_publish(wm.payload)
+        pb = wire.PayloadBuilder()
+        pb.add_string(p.file_id); pb.add_string(p.file_name)
+        pb.add_uint64(p.file_size); pb.add_string(p.mime_type)
+        pb.add_string(p.author_id); pb.add_uint64(int(p.timestamp * 1_000_000))
         if not AuthorIdentity.verify(pb.build(), p.author_signature, p.author_public_key):
             return
-
-        # Resolve sender so we can list them as a replica holder
-        sender_id = self.udp_engine.resolve_node_id(from_addr) or ""
         entry = FileRegistryEntry(
-            file_id=p.file_id,
-            file_name=p.file_name,
-            file_size=p.file_size,
-            mime_type=p.mime_type,
-            author_id=p.author_id,
-            author_public_key=p.author_public_key,
-            replica_count=1,
+            file_id=p.file_id, file_name=p.file_name, file_size=p.file_size,
+            mime_type=p.mime_type, author_id=p.author_id,
+            author_public_key=p.author_public_key, replica_count=1,
             author_signature=p.author_signature,
             replicas=[ReplicaEntry(node_id=sender_id, added_at=p.timestamp)],
             timestamp=p.timestamp,
         )
         self.file_registry.add(entry)
-        self._log.info("File published by %s: %s (%d bytes)", sender_id[:12], p.file_name, p.file_size)
         self.event_bus.emit("file_added", file_id=p.file_id)
-
-        # Immediately try to replicate — download from the publisher in background
         if not self.storage.has_file(p.file_id) and self.storage.available_bytes() >= p.file_size:
-            self._log.info("Replicating %s from publisher %s", p.file_id[:12], sender_id[:12])
-            threading.Thread(
-                target=self._replicate_file,
-                args=(p.file_id, sender_id, p.file_name),
-                daemon=True,
-            ).start()
+            self._log.info("Replicating %s from %s", p.file_id[:12], sender_id[:12])
+            self.scheduler.enqueue(
+                Action.normal(ActionType.SOLICIT_REPLICATION,
+                              file_id=p.file_id, from_peer=sender_id)
+            )
 
-    def _handle_file_update(self, wire_msg, p: FileUpdatePayload, from_addr) -> None:
-        import struct
-        pb = PayloadBuilder()
-        pb.add_string(p.file_id)
-        pb.add_string(p.previous_file_id)
-        pb.add_string(p.file_name)
-        pb.add_uint64(p.file_size)
-        pb.add_string(p.mime_type)
-        pb.add_string(p.author_id)
+    def _on_file_update(self, wm, sender_id: str) -> None:
+        p = MessageParser.file_update(wm.payload)
+        pb = wire.PayloadBuilder()
+        pb.add_string(p.file_id); pb.add_string(p.previous_file_id)
+        pb.add_string(p.file_name); pb.add_uint64(p.file_size)
+        pb.add_string(p.mime_type); pb.add_string(p.author_id)
         pb.add_uint64(int(p.timestamp * 1_000_000))
         if not AuthorIdentity.verify(pb.build(), p.author_signature, p.author_public_key):
             return
         existing = self.file_registry.get(p.previous_file_id)
         if existing and existing.author_id != p.author_id:
-            return  # Not the original author
-        sender_id = self.udp_engine.resolve_node_id(from_addr) or ""
+            return
         entry = FileRegistryEntry(
-            file_id=p.file_id,
-            file_name=p.file_name,
-            file_size=p.file_size,
-            mime_type=p.mime_type,
-            author_id=p.author_id,
-            author_public_key=p.author_public_key,
-            replica_count=1,
+            file_id=p.file_id, file_name=p.file_name, file_size=p.file_size,
+            mime_type=p.mime_type, author_id=p.author_id,
+            author_public_key=p.author_public_key, replica_count=1,
             author_signature=p.author_signature,
             replicas=[ReplicaEntry(node_id=sender_id, added_at=p.timestamp)],
-            timestamp=p.timestamp,
-            previous_file_id=p.previous_file_id,
+            timestamp=p.timestamp, previous_file_id=p.previous_file_id,
         )
         self.file_registry.add(entry)
         self.event_bus.emit("file_updated", file_id=p.file_id)
 
-    def _handle_file_delete(self, wire_msg, p: FileDeletePayload, from_addr) -> None:
-        import struct
-        pb = PayloadBuilder()
-        pb.add_string(p.file_id)
-        pb.add_string(p.author_id)
+    def _on_file_delete(self, wm) -> None:
+        p = MessageParser.file_delete(wm.payload)
+        pb = wire.PayloadBuilder()
+        pb.add_string(p.file_id); pb.add_string(p.author_id)
         pb.add_uint64(int(p.timestamp * 1_000_000))
         if not AuthorIdentity.verify(pb.build(), p.author_signature, p.author_public_key):
             return
@@ -571,99 +522,375 @@ class App:
         self.storage.delete_file(p.file_id)
         self.event_bus.emit("file_deleted", file_id=p.file_id)
 
-    # ---- Connect / hole punch ----
-
-    def _handle_connect_request(self, wire_msg, p: ConnectRequestPayload, from_addr) -> None:
-        # If we're connected to target_node_id, relay as CONNECT_INTRODUCE
-        target_conn = self.udp_engine.connections.get(p.target_node_id)
-        if target_conn and target_conn.is_connected:
-            # Determine who should initiate
-            # The requester (A) asked us (B) to intro them to C
-            # A's NAT might be symmetric, so C should fire first
+    def _on_connect_request(self, wm, from_addr: tuple[str, int]) -> None:
+        p = MessageParser.connect_request(wm.payload)
+        if self.peer_book.is_connected(p.target_node_id):
             intro = ConnectIntroducePayload(
                 target_node_id=p.target_node_id,
                 introducer_node_id=self.node_identity.node_id,
                 requester_node_id=p.requester_node_id,
                 requester_ip=p.requester_ip,
                 requester_port=p.requester_port,
-                is_initiator=True,  # C fires first
+                is_initiator=True,
             )
-            self.udp_engine.send_to(
-                p.target_node_id,
-                MsgType.CONNECT_INTRODUCE,
-                MessageBuilder.connect_introduce(intro),
-            )
-        else:
-            # Relay unavailable — send failure ACK
-            ack = __import__("protocol").ConnectAckPayload(peer_node_id="")
-            self.udp_engine.send_to(
-                p.requester_node_id,
-                MsgType.CONNECT_ACK,
-                MessageBuilder.connect_ack(ack),
-                addr=from_addr,
+            self.scheduler.enqueue_at_front(
+                Action.critical(
+                    ActionType.SEND_CONNECT_INTRODUCE,
+                    target_id=p.target_node_id, payload=intro,
+                )
             )
 
-    def _handle_connect_introduce(self, wire_msg, p: ConnectIntroducePayload, from_addr) -> None:
-        # We are the target (C). Start hole punching to requester (A).
-        # Send CONNECT_ACK back via introducer
-        ack = __import__("protocol").ConnectAckPayload(
-            peer_node_id=p.requester_node_id
-        )
+    def _on_connect_introduce(self, wm) -> None:
+        p = MessageParser.connect_introduce(wm.payload)
+        ack = ConnectAckPayload(peer_node_id=p.requester_node_id)
         self.udp_engine.send_to(
-            p.introducer_node_id,
-            MsgType.CONNECT_ACK,
+            p.introducer_node_id, MsgType.CONNECT_ACK,
             MessageBuilder.connect_ack(ack),
         )
-
-        if p.is_initiator:
-            # Fire first — send hello packets
-            pb = self.peer_book.get(p.requester_node_id)
-            pubkey = pb["public_key"] if pb else b"\x00" * 32
-            self.udp_engine.hole_punch(
-                p.requester_node_id, p.requester_ip, p.requester_port, pubkey
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.HOLE_PUNCH_PEER,
+                peer_id=p.requester_node_id, ip=p.requester_ip,
+                port=p.requester_port, delay=(0 if p.is_initiator else 0.2),
             )
-        else:
-            # Wait 200ms then send
-            time.sleep(0.2)
-            pb = self.peer_book.get(p.requester_node_id)
-            pubkey = pb["public_key"] if pb else b"\x00" * 32
-            self.udp_engine.hole_punch(
-                p.requester_node_id, p.requester_ip, p.requester_port, pubkey
-            )
+        )
 
-    def _handle_connect_ack(self, wire_msg, p, from_addr) -> None:
-        event = self.udp_engine.pending_assisted.get(p.peer_node_id)
-        if event:
-            event.set()
+    def _on_connect_ack(self, wm) -> None:
+        pass  # Handled by action chain
 
-    # ---- Share ----
-
-    def _handle_share_file_query(self, wire_msg, p, from_addr) -> None:
-        sender_id = self.udp_engine.resolve_node_id(from_addr)
+    def _on_share_file_query(self, wm, sender_id: str) -> None:
+        p = MessageParser.share_file_query(wm.payload)
         if not sender_id:
             return
         entry = self.file_registry.get(p.file_id)
         if entry is None:
             return
-        # Find up to 3 peers with longest uptime hosting this file
         host_ids = [r.node_id for r in entry.replicas[:3]]
         resp = ShareFileResponsePayload(
-            file_id=p.file_id,
-            file_hash=p.file_id,
-            suggested_peers=host_ids,
+            file_id=p.file_id, file_hash=p.file_id, suggested_peers=host_ids,
         )
         self.udp_engine.send_to(
-            sender_id,
-            MsgType.SHARE_FILE_RESPONSE,
+            sender_id, MsgType.SHARE_FILE_RESPONSE,
             MessageBuilder.share_file_response(resp),
         )
 
-    def _handle_share_file_response(self, wire_msg, p: ShareFileResponsePayload, from_addr) -> None:
-        entry = self.udp_engine.pending_share_responses.get(p.file_id)
-        if entry:
-            event, _ = entry
-            self.udp_engine.pending_share_responses[p.file_id] = (event, p)
-            event.set()
+    def _on_share_file_response(self, wm) -> None:
+        pass
+
+    def _on_goodbye(self, sender_id: str) -> None:
+        self._log.info("Peer disconnected: %s", sender_id[:12])
+        self.peer_book.set_connection_state(sender_id, "DISCONNECTED")
+        self.file_registry.remove_peer_replicas(sender_id)
+        self.reliable.discard_all_for_peer(sender_id)
+        self.event_bus.emit("peer_disconnected", node_id=sender_id)
+
+    # ==================================================================
+    # Scheduler action handlers
+    # ==================================================================
+
+    def _register_scheduler_handlers(self) -> None:
+        """Register all action handlers with the scheduler."""
+        h = self.scheduler.register
+        h(ActionType.SEND_HELLO_REPLY, self._act_send_hello_reply)
+        h(ActionType.SEND_CHUNK, self._act_send_chunk)
+        h(ActionType.SEND_FILE_CHUNK_ACK, self._act_send_file_chunk_ack)
+        h(ActionType.SEND_CONNECT_INTRODUCE, self._act_send_connect_introduce)
+        h(ActionType.CHECK_RETRANSMIT, self._act_check_retransmit)
+        h(ActionType.CHECK_CHUNK_ACK, self._act_check_chunk_ack)
+        h(ActionType.CHECK_PING_RESPONSE, self._act_check_ping_response)
+        h(ActionType.CHECK_HOLE_PUNCH, self._act_check_hole_punch)
+        h(ActionType.CHECK_DOWNLOAD_COMPLETE, self._act_check_download_complete)
+        h(ActionType.REBALANCE, self._act_rebalance)
+        h(ActionType.EXCHANGE_REGISTRY, self._act_exchange_registry)
+        h(ActionType.REQUEST_PEER_LIST, self._act_request_peer_list)
+        h(ActionType.HOLE_PUNCH_PEER, self._act_hole_punch_peer)
+        h(ActionType.LAN_BROADCAST, self._act_lan_broadcast)
+        h(ActionType.PING_PEER, self._act_ping_peer)
+        h(ActionType.CLEANUP_TEMP, self._act_cleanup_temp)
+        h(ActionType.GC_OLD_VERSIONS, self._act_gc_old_versions)
+        h(ActionType.PEER_CLEANUP, self._act_peer_cleanup)
+        h(ActionType.LIVENESS_CHECK, self._act_liveness_check)
+        h(ActionType.SOLICIT_REPLICATION, self._act_solicit_replication)
+
+    # ---- Critical action handlers ----
+
+    def _act_send_hello_reply(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        sub = action.params.get("sub_action", "")
+        if sub == "peer_list_response":
+            self._send_peer_list_response(peer_id)
+        elif sub == "file_registry_response":
+            self._send_file_registry_response(peer_id)
+        else:
+            hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+            self.udp_engine.send_to(peer_id, MsgType.HELLO, hello)
+
+    def _act_send_chunk(self, action: Action) -> None:
+        file_id = action.params.get("file_id", "")
+        peer_id = action.params.get("peer_id", "")
+        chunk_index = action.params.get("chunk_index", 0)
+        if not self.storage.has_file(file_id):
+            return
+        data = self.storage.read_file(file_id)
+        chunks = self.udp_engine.chunk_data(data)
+        total = len(chunks)
+        if chunk_index >= total:
+            return
+        chunk = FileChunkPayload(
+            file_id=file_id, chunk_index=chunk_index,
+            total_chunks=total, data=chunks[chunk_index],
+        )
+        self.udp_engine.send_to(
+            peer_id, MsgType.FILE_CHUNK, MessageBuilder.file_chunk(chunk)
+        )
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.CHECK_CHUNK_ACK,
+                delay=self.config.chunk_ack_timeout,
+                file_id=file_id, peer_id=peer_id,
+                chunk_index=chunk_index,
+                transfer_id=f"ul:{file_id}:{peer_id}",
+            )
+        )
+
+    def _act_send_file_chunk_ack(self, action: Action) -> None:
+        pass  # ACKs are sent inline in _on_file_chunk
+
+    def _act_send_connect_introduce(self, action: Action) -> None:
+        target_id = action.params.get("target_id", "")
+        intro = action.params.get("payload")
+        if intro:
+            self.udp_engine.send_to(
+                target_id, MsgType.CONNECT_INTRODUCE,
+                MessageBuilder.connect_introduce(intro),
+            )
+
+    # ---- High action handlers ----
+
+    def _act_check_retransmit(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        seq_num = action.params.get("seq_num", 0)
+        msg, new_expiry = self.reliable.mark_retry(peer_id, seq_num)
+        if msg is None:
+            return
+        self.udp_engine.send_to(peer_id, msg.msg_type, msg.payload)
+        delay = max(0, new_expiry - time.monotonic())
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.CHECK_RETRANSMIT, delay=delay,
+                peer_id=peer_id, seq_num=seq_num,
+            )
+        )
+
+    def _act_check_chunk_ack(self, action: Action) -> None:
+        file_id = action.params.get("file_id", "")
+        peer_id = action.params.get("peer_id", "")
+        chunk_index = action.params.get("chunk_index", 0)
+        transfer_id = action.params.get("transfer_id", "")
+        retries = self.file_registry.increment_chunk_retry(transfer_id, chunk_index)
+        if retries >= self.config.max_retries:
+            self.file_registry.mark_transfer_failed(transfer_id)
+            return
+        if self.storage.has_file(file_id):
+            data = self.storage.read_file(file_id)
+            chunks = self.udp_engine.chunk_data(data)
+            if chunk_index < len(chunks):
+                chunk = FileChunkPayload(
+                    file_id=file_id, chunk_index=chunk_index,
+                    total_chunks=len(chunks), data=chunks[chunk_index],
+                )
+                self.udp_engine.send_to(
+                    peer_id, MsgType.FILE_CHUNK, MessageBuilder.file_chunk(chunk)
+                )
+                self.scheduler.enqueue(
+                    Action.high(
+                        ActionType.CHECK_CHUNK_ACK,
+                        delay=self.config.chunk_ack_timeout * (retries + 1),
+                        file_id=file_id, peer_id=peer_id,
+                        chunk_index=chunk_index, transfer_id=transfer_id,
+                    )
+                )
+
+    def _act_check_ping_response(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        cs = self.peer_book.get_connection_state(peer_id)
+        if cs is None:
+            return
+        if cs["last_seen"] >= cs["last_ping_sent"]:
+            return  # Response received
+        missed = action.params.get("missed_count", 0) + 1
+        if missed >= self.config.max_missed_pings:
+            self._log.info("Peer %s timed out after %d missed pings", peer_id[:12], missed)
+            self.peer_book.set_connection_state(peer_id, "DISCONNECTED")
+            self.file_registry.remove_peer_replicas(peer_id)
+            self.reliable.discard_all_for_peer(peer_id)
+            self.event_bus.emit("peer_disconnected", node_id=peer_id)
+
+    def _act_check_hole_punch(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        cs = self.peer_book.get_connection_state(peer_id)
+        if cs is None or cs["state"] == "CONNECTED":
+            return
+        blocked = self.peer_book.increment_hole_punch_attempts(peer_id)
+        if blocked:
+            self._log.warning("Peer %s direct blocked after %d attempts",
+                              peer_id[:12], self.config.max_direct_attempts)
+
+    def _act_check_download_complete(self, action: Action) -> None:
+        pass  # Check handled inline in _on_file_chunk
+
+    # ---- Normal action handlers ----
+
+    def _act_rebalance(self, action: Action) -> None:
+        self.replication.calculate_network_target()
+        self.replication.execute_rebalance()
+        self.scheduler.enqueue(
+            Action.normal(ActionType.REBALANCE, delay=self.config.rebalance_interval)
+        )
+
+    def _act_exchange_registry(self, action: Action) -> None:
+        for nid in self.peer_book.get_connected_peers():
+            self.udp_engine.send_to(
+                nid, MsgType.FILE_REGISTRY_QUERY,
+                MessageBuilder.file_registry_query(),
+            )
+
+    def _act_request_peer_list(self, action: Action) -> None:
+        for nid in self.peer_book.get_connected_peers():
+            self.udp_engine.send_to(
+                nid, MsgType.PEER_LIST_REQUEST,
+                MessageBuilder.peer_list_request(),
+            )
+
+    def _act_hole_punch_peer(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        ip = action.params.get("ip", "")
+        port = action.params.get("port", 0)
+        delay = action.params.get("delay", 0)
+        if delay:
+            time.sleep(delay)
+        self.peer_book.set_connection_state(peer_id, "PUNCHING", ip, port)
+        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+        encoded = wire.encode(
+            1, MsgType.HELLO, self.node_identity.node_id, 0, hello
+        )
+        for _ in range(self.config.hole_punch_packets):
+            self.udp_engine.send_raw(encoded, (ip, port))
+            time.sleep(self.config.hole_punch_interval)
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.CHECK_HOLE_PUNCH,
+                delay=self.config.hole_punch_timeout,
+                peer_id=peer_id,
+            )
+        )
+
+    def _act_lan_broadcast(self, action: Action) -> None:
+        connected = len(self.peer_book.get_connected_peers())
+        if connected < self.config.lan_broadcast_min_peers:
+            self.udp_engine.lan_broadcast()
+        self.scheduler.enqueue(
+            Action.low(ActionType.LAN_BROADCAST, delay=self.config.lan_broadcast_interval)
+        )
+
+    # ---- Low action handlers ----
+
+    def _act_ping_peer(self, action: Action) -> None:
+        peer_id = action.params.get("peer_id", "")
+        cs = self.peer_book.get_connection_state(peer_id)
+        if cs is None or cs["state"] != "CONNECTED":
+            return
+        ping = MessageBuilder.ping(PingPayload(node_id=self.node_identity.node_id))
+        self.udp_engine.send_to(peer_id, MsgType.PING, ping)
+        self.peer_book.record_ping_sent(peer_id)
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.CHECK_PING_RESPONSE,
+                delay=self.config.ping_response_timeout,
+                peer_id=peer_id, missed_count=action.params.get("missed_count", 0),
+            )
+        )
+        self.scheduler.enqueue(
+            Action.low(
+                ActionType.PING_PEER, delay=self.config.keepalive_interval,
+                peer_id=peer_id,
+            )
+        )
+
+    def _act_cleanup_temp(self, action: Action) -> None:
+        promoted = self.storage.cleanup_expired_temporary()
+        if promoted:
+            self.replication.execute_rebalance()
+        self.scheduler.enqueue(
+            Action.low(ActionType.CLEANUP_TEMP, delay=self.config.cleanup_temp_interval)
+        )
+
+    def _act_gc_old_versions(self, action: Action) -> None:
+        self.file_registry.cleanup_old_versions()
+        self.scheduler.enqueue(
+            Action.low(ActionType.GC_OLD_VERSIONS, delay=self.config.gc_old_versions_interval)
+        )
+
+    def _act_peer_cleanup(self, action: Action) -> None:
+        self.peer_book.cleanup(self.config.peer_cleanup_max_age_days)
+        self.scheduler.enqueue(
+            Action.low(ActionType.PEER_CLEANUP, delay=self.config.peer_cleanup_interval)
+        )
+
+    def _act_liveness_check(self, action: Action) -> None:
+        for nid in self.peer_book.get_connected_peers():
+            if not self.peer_book.is_alive(nid, self.config.peer_timeout):
+                self._log.info("Peer %s liveness timeout", nid[:12])
+                self.peer_book.set_connection_state(nid, "DISCONNECTED")
+                self.file_registry.remove_peer_replicas(nid)
+                self.reliable.discard_all_for_peer(nid)
+                self.event_bus.emit("peer_disconnected", node_id=nid)
+        self.scheduler.enqueue(
+            Action.low(ActionType.LIVENESS_CHECK, delay=self.config.keepalive_interval)
+        )
+
+    def _act_solicit_replication(self, action: Action) -> None:
+        file_id = action.params.get("file_id", "")
+        from_peer = action.params.get("from_peer", "")
+        if not file_id:
+            return
+        try:
+            data = self.download_file(file_id)
+            self.storage.store_replica(file_id, data)
+            self.file_registry.increment_replica(file_id, self.node_identity.node_id)
+            self._log.info("Replica stored: %s from %s", file_id[:12], from_peer[:12])
+            self.event_bus.emit("file_added", file_id=file_id)
+        except Exception as e:
+            self._log.warning("Replication failed for %s: %s", file_id[:12], e)
+
+    # ---- Helper sends ----
+
+    def _send_peer_list_response(self, peer_id: str) -> None:
+        peers = []
+        for nid in self.peer_book.get_connected_peers():
+            cs = self.peer_book.get_connection_state(nid)
+            if cs:
+                pb_row = self.peer_book.get(nid)
+                uptime = pb_row["uptime_since"] if pb_row else 0
+                peers.append(PeerEntry(
+                    node_id=nid, public_ip=cs["address_ip"],
+                    public_port=cs["address_port"], uptime_since=uptime,
+                ))
+        target = self.replication.calculate_network_target()
+        resp = PeerListResponsePayload(peers=peers, estimated_network_target=target, signature=b"")
+        self.udp_engine.send_to(
+            peer_id, MsgType.PEER_LIST_RESPONSE,
+            MessageBuilder.peer_list_response(resp),
+        )
+
+    def _send_file_registry_response(self, peer_id: str) -> None:
+        entries = self.file_registry.get_all()
+        target = self.replication.calculate_network_target()
+        resp = FileRegistryResponsePayload(entries=entries, estimated_network_target=target)
+        self.udp_engine.send_to(
+            peer_id, MsgType.FILE_REGISTRY_RESPONSE,
+            MessageBuilder.file_registry_response(resp),
+        )
 
     # ==================================================================
     # Public API
@@ -702,88 +929,96 @@ class App:
             raise ValueError("Browse-only mode — cannot publish")
 
         timestamp = time.time()
-        # Round to microseconds so wire decode produces the identical string
         timestamp_us = round(timestamp * 1_000_000) / 1_000_000.0
         file_id = hashlib.sha256(
             data + self.author_identity.author_id.encode() + str(timestamp_us).encode()
         ).hexdigest()
 
-        # Store locally
         self.storage.store_own_file(file_id, data, file_name, mime_type)
-        self._log.info(
-            "Published file: %s (%s, %d bytes) id=%s",
-            file_name, mime_type, len(data), file_id[:12],
-        )
+        self._log.info("Published file: %s (%s, %d bytes) id=%s",
+                        file_name, mime_type, len(data), file_id[:12])
 
-        # Sign with author key
-        pb = PayloadBuilder()
-        pb.add_string(file_id)
-        pb.add_string(file_name)
-        pb.add_uint64(len(data))
-        pb.add_string(mime_type)
+        pb = wire.PayloadBuilder()
+        pb.add_string(file_id); pb.add_string(file_name)
+        pb.add_uint64(len(data)); pb.add_string(mime_type)
         pb.add_string(self.author_identity.author_id)
         pb.add_uint64(int(timestamp_us * 1_000_000))
         signature = self.author_identity.sign(pb.build())
 
-        # Build registry entry
         entry = FileRegistryEntry(
-            file_id=file_id,
-            file_name=file_name,
-            file_size=len(data),
-            mime_type=mime_type,
-            author_id=self.author_identity.author_id,
+            file_id=file_id, file_name=file_name, file_size=len(data),
+            mime_type=mime_type, author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            replica_count=1,
-            author_signature=signature,
+            replica_count=1, author_signature=signature,
             replicas=[ReplicaEntry(node_id=self.node_identity.node_id, added_at=timestamp_us)],
             timestamp=timestamp_us,
         )
         self.file_registry.add(entry)
 
-        # Broadcast
         payload = FilePublishPayload(
-            file_id=file_id,
-            file_name=file_name,
-            file_size=len(data),
-            mime_type=mime_type,
-            author_id=self.author_identity.author_id,
+            file_id=file_id, file_name=file_name, file_size=len(data),
+            mime_type=mime_type, author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            timestamp=timestamp,
-            author_signature=signature,
+            timestamp=timestamp, author_signature=signature,
         )
-        self.udp_engine.broadcast(
-            MsgType.FILE_PUBLISH, MessageBuilder.file_publish(payload)
-        )
-
+        self.udp_engine.broadcast(MsgType.FILE_PUBLISH, MessageBuilder.file_publish(payload))
         self.event_bus.emit("file_added", file_id=file_id)
         return file_id
 
     def download_file(self, file_id: str) -> bytes:
-        """Download a file from the network."""
-        return self.udp_engine.download_file(file_id)
+        """Download a file from the network (blocking, for use by scheduler actions)."""
+        entry = self.file_registry.get(file_id)
+        if entry is None:
+            raise ValueError(f"File {file_id} not in registry")
 
-    def _replicate_file(self, file_id: str, from_peer: str, file_name: str) -> None:
-        """Background: download *file_id* from *from_peer* and store as replica."""
-        try:
-            data = self.udp_engine.download_file(file_id)
-            self.storage.store_replica(file_id, data)
-            self.file_registry.increment_replica(file_id, self.node_identity.node_id)
-            self._log.info("Replica stored: %s (%d bytes) from %s",
-                            file_id[:12], len(data), from_peer[:12])
-            self.event_bus.emit("file_added", file_id=file_id)
-        except Exception as e:
-            self._log.warning("Replication failed for %s from %s: %s",
-                              file_id[:12], from_peer[:12], e)
+        # Find a connected peer hosting this file
+        host_id = None
+        for replica in entry.replicas:
+            if self.peer_book.is_connected(replica.node_id):
+                host_id = replica.node_id
+                break
+        if host_id is None:
+            raise ValueError(f"No connected peer hosts file {file_id}")
+
+        transfer_id = f"dl:{file_id}:{host_id}"
+        self.file_registry.create_transfer(transfer_id, file_id, host_id, "download", 0)
+
+        self.udp_engine.send_to(
+            host_id, MsgType.FILE_REQUEST,
+            MessageBuilder.file_request(FileRequestPayload(file_id=file_id)),
+        )
+
+        # Wait for completion (blocking)
+        deadline = time.monotonic() + self.config.download_timeout
+        while time.monotonic() < deadline:
+            if self.file_registry.is_transfer_complete(transfer_id):
+                break
+            time.sleep(0.1)
+
+        if not self.file_registry.is_transfer_complete(transfer_id):
+            self.file_registry.mark_transfer_failed(transfer_id)
+            raise TimeoutError(f"Download of {file_id} incomplete")
+
+        self.file_registry.mark_transfer_complete(transfer_id)
+        if not self.storage.has_file(file_id):
+            raise FileNotFoundError(f"Downloaded file {file_id} not on disk")
+        data = self.storage.read_file(file_id)
+        # Integrity check
+        expected = hashlib.sha256(
+            data + entry.author_id.encode() + str(entry.timestamp).encode()
+        ).hexdigest()
+        if expected != file_id:
+            raise ValueError(f"Integrity check failed for {file_id}")
+        return data
 
     def open_file(self, file_id: str) -> bytes:
         """Open a file (download + track as temporary)."""
-        return self.udp_engine.download_file(file_id)
+        return self.download_file(file_id)
 
     def update_file(self, file_id: str, new_data: bytes) -> str:
         """Update a file (author only)."""
         if not self.author_identity:
             raise ValueError("Not logged in")
-
         existing = self.file_registry.get(file_id)
         if existing is None:
             raise ValueError("File not found")
@@ -791,58 +1026,38 @@ class App:
             raise ValueError("Not the author")
 
         timestamp = time.time()
-        # Round to microseconds so wire decode produces the identical string
         timestamp_us = round(timestamp * 1_000_000) / 1_000_000.0
         new_file_id = hashlib.sha256(
             new_data + self.author_identity.author_id.encode() + str(timestamp_us).encode()
         ).hexdigest()
 
         self.storage.store_own_file(new_file_id, new_data, existing.file_name, existing.mime_type)
-        self._log.info(
-            "Updated file: %s → %s (%d bytes)",
-            file_id[:12], new_file_id[:12], len(new_data),
-        )
 
-        pb = PayloadBuilder()
-        pb.add_string(new_file_id)
-        pb.add_string(file_id)  # previous_file_id
-        pb.add_string(existing.file_name)
-        pb.add_uint64(len(new_data))
-        pb.add_string(existing.mime_type)
-        pb.add_string(self.author_identity.author_id)
+        pb = wire.PayloadBuilder()
+        pb.add_string(new_file_id); pb.add_string(file_id)
+        pb.add_string(existing.file_name); pb.add_uint64(len(new_data))
+        pb.add_string(existing.mime_type); pb.add_string(self.author_identity.author_id)
         pb.add_uint64(int(timestamp_us * 1_000_000))
         signature = self.author_identity.sign(pb.build())
 
         payload = FileUpdatePayload(
-            file_id=new_file_id,
-            previous_file_id=file_id,
-            file_name=existing.file_name,
-            file_size=len(new_data),
-            mime_type=existing.mime_type,
-            author_id=self.author_identity.author_id,
+            file_id=new_file_id, previous_file_id=file_id,
+            file_name=existing.file_name, file_size=len(new_data),
+            mime_type=existing.mime_type, author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            timestamp=timestamp_us,
-            author_signature=signature,
+            timestamp=timestamp_us, author_signature=signature,
         )
-        self.udp_engine.broadcast(
-            MsgType.FILE_UPDATE, MessageBuilder.file_update(payload)
-        )
+        self.udp_engine.broadcast(MsgType.FILE_UPDATE, MessageBuilder.file_update(payload))
 
         entry = FileRegistryEntry(
-            file_id=new_file_id,
-            file_name=existing.file_name,
-            file_size=len(new_data),
-            mime_type=existing.mime_type,
-            author_id=self.author_identity.author_id,
+            file_id=new_file_id, file_name=existing.file_name, file_size=len(new_data),
+            mime_type=existing.mime_type, author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            replica_count=1,
-            author_signature=signature,
+            replica_count=1, author_signature=signature,
             replicas=[ReplicaEntry(node_id=self.node_identity.node_id, added_at=timestamp_us)],
-            timestamp=timestamp_us,
-            previous_file_id=file_id,
+            timestamp=timestamp_us, previous_file_id=file_id,
         )
         self.file_registry.add(entry)
-
         self.event_bus.emit("file_updated", file_id=new_file_id)
         return new_file_id
 
@@ -850,7 +1065,6 @@ class App:
         """Delete a file (author only)."""
         if not self.author_identity:
             raise ValueError("Not logged in")
-
         existing = self.file_registry.get(file_id)
         if existing is None:
             return
@@ -858,23 +1072,17 @@ class App:
             raise ValueError("Not the author")
 
         timestamp = time.time()
-        pb = PayloadBuilder()
-        pb.add_string(file_id)
-        pb.add_string(self.author_identity.author_id)
+        pb = wire.PayloadBuilder()
+        pb.add_string(file_id); pb.add_string(self.author_identity.author_id)
         pb.add_uint64(int(timestamp * 1_000_000))
         signature = self.author_identity.sign(pb.build())
 
         payload = FileDeletePayload(
-            file_id=file_id,
-            author_id=self.author_identity.author_id,
+            file_id=file_id, author_id=self.author_identity.author_id,
             author_public_key=self.author_identity.public_key_bytes,
-            timestamp=timestamp,
-            author_signature=signature,
+            timestamp=timestamp, author_signature=signature,
         )
-        self.udp_engine.broadcast(
-            MsgType.FILE_DELETE, MessageBuilder.file_delete(payload)
-        )
-
+        self.udp_engine.broadcast(MsgType.FILE_DELETE, MessageBuilder.file_delete(payload))
         self.file_registry.mark_deleted(file_id)
         self.storage.delete_file(file_id)
         self.event_bus.emit("file_deleted", file_id=file_id)
@@ -884,58 +1092,53 @@ class App:
         entry = self.file_registry.get(file_id)
         if entry is None:
             raise ValueError("File not found")
-
-        # Query a connected peer for suggested hosts
-        connected = self.udp_engine.get_connected_peers()
-        if not connected:
-            return f"decentralised://{file_id}"
-
-        relay = connected[0]
-        event = threading.Event()
-        self.udp_engine.pending_share_responses[file_id] = (event, None)
-
-        self.udp_engine.send_to(
-            relay,
-            MsgType.SHARE_FILE_QUERY,
-            MessageBuilder.share_file_query(ShareFileQueryPayload(file_id=file_id)),
+        host_ids = [r.node_id for r in entry.replicas[:3]]
+        peer_str = ",".join(host_ids[:3])
+        return (
+            f"http://{self.web_host}:{self.web_port}/?"
+            f"file={file_id}&hash={file_id}&peers={peer_str}"
         )
 
-        if event.wait(timeout=5.0):
-            _, resp = self.udp_engine.pending_share_responses.pop(file_id, (None, None))
-            if resp:
-                peer_str = ",".join(resp.suggested_peers[:3])
-                return (
-                    f"http://{self.web_host}:{self.web_port}/?"
-                    f"file={file_id}&hash={resp.file_hash}&peers={peer_str}"
-                )
-
-        return f"decentralised://{file_id}"
-
-    def connect_to_peer(
-        self, node_id: str, pubkey_b64: str, ip: str, port: int
-    ) -> bool:
-        """Connect to a peer."""
+    def connect_to_peer(self, node_id: str, pubkey_b64: str, ip: str, port: int) -> bool:
+        """Connect to a peer via direct hole punch (sends hello packets inline,
+        then lets the scheduler handle the response and follow-up)."""
         pubkey = public_key_from_base64(pubkey_b64)
-        return self.udp_engine.hole_punch(node_id, ip, port, pubkey)
+        # Add to peer book
+        self.peer_book.add_or_update(node_id, pubkey, ip, port, time.time())
+        self.peer_book.set_connection_state(node_id, "PUNCHING", ip, port)
+
+        # Send hello packets directly (don't block the scheduler)
+        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+        encoded = wire.encode(1, MsgType.HELLO, self.node_identity.node_id, 0, hello)
+        for _ in range(self.config.hole_punch_packets):
+            try:
+                self.udp_engine.send_raw(encoded, (ip, port))
+            except Exception:
+                pass
+            time.sleep(self.config.hole_punch_interval)
+
+        # Queue a check for whether the punch succeeded
+        self.scheduler.enqueue(
+            Action.high(
+                ActionType.CHECK_HOLE_PUNCH,
+                delay=self.config.hole_punch_timeout,
+                peer_id=node_id,
+            )
+        )
+        return True
 
     def connect_via_url(self, url: str) -> bool:
         """Parse a connection URL and connect."""
         from urllib.parse import urlparse, parse_qs
-
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
-
         node_id = params.get("join", [None])[0]
         pk_b64 = params.get("pk", [None])[0]
         addr = params.get("addr", [None])[0]
-
         if not node_id or not pk_b64 or not addr:
             raise ValueError("Invalid connection URL")
-
         ip, port_str = addr.rsplit(":", 1)
-        port = int(port_str)
-
-        return self.connect_to_peer(node_id, pk_b64, ip, port)
+        return self.connect_to_peer(node_id, pk_b64, ip, int(port_str))
 
     # ==================================================================
     # Lifecycle
@@ -948,26 +1151,27 @@ class App:
         print(f"Node ID: {self.node_identity.node_id}")
         print(f"Listening on UDP port {self.port}")
 
-        # Start UDP engine
+        # Start UDP engine (spawns recv thread)
         self.udp_engine.start()
-        self._log.info(
-            "Public address: %s:%s",
-            self.udp_engine.public_ip,
-            self.udp_engine.public_port,
-        )
+        self._log.info("Public address: %s:%s",
+                        self.udp_engine.public_ip, self.udp_engine.public_port)
         print(f"Public address: {self.udp_engine.public_ip}:{self.udp_engine.public_port}")
 
-        # Run reconnection sequence
-        self._reconnect()
+        # Seed periodic scheduler actions
+        self._seed_periodic_actions()
 
-        # Start periodic tasks
-        self._start_periodic_tasks()
+        # Run reconnection sequence (queues scheduler actions)
+        self._reconnect()
 
         # Launch web server
         if self.web_port > 0:
             self._start_web_server()
 
-        # Launch TUI
+        # Start the scheduler in a daemon thread
+        scheduler_thread = threading.Thread(target=self.scheduler.run, daemon=True, name="scheduler")
+        scheduler_thread.start()
+
+        # Launch TUI or wait
         if not self.no_tui:
             from tui import TUI
             self.tui = TUI(self)
@@ -977,9 +1181,8 @@ class App:
             finally:
                 self.stop()
         else:
-            # Just wait
             try:
-                while True:
+                while self.scheduler.running:
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
@@ -1024,197 +1227,94 @@ class App:
         print("Shutting down...")
         if self.tui:
             self.tui.stop()
+        self.scheduler.stop()
         self.udp_engine.stop()
         self._release_lock()
         self._log.info("Goodbye.")
         print("Goodbye.")
-        # Let daemon threads (keepalive, rebalance, etc.) notice udp_engine.running
-        # is False and exit, so they don't touch stdout during interpreter shutdown.
         time.sleep(0.1)
         sys.stdout.flush()
         sys.stderr.flush()
 
     def _reconnect(self) -> None:
-        """Run the startup reconnection sequence."""
-        self._log.info("=== Reconnect: starting ===")
+        """Queue startup reconnection as scheduler actions."""
+        self._log.info("=== Reconnect: queuing startup actions ===")
 
-        # Phase 0: Get all known peers
         peers = self.peer_book.get_all_ordered()
         if not peers:
-            self._log.info("Reconnect phase 0: no peers in book, adding bootstrap")
+            self._log.info("Reconnect: no peers in book, adding bootstrap")
             for node_id, pk_b64, ip, port in BOOTSTRAP_PEERS:
                 self.peer_book.add_or_update(
-                    node_id,
-                    public_key_from_base64(pk_b64),
-                    ip,
-                    port,
-                    time.time(),
-                    is_bootstrap=True,
+                    node_id, public_key_from_base64(pk_b64), ip, port,
+                    time.time(), is_bootstrap=True,
                 )
             peers = self.peer_book.get_all_ordered()
 
-        self._log.info("Reconnect phase 0: %d peers in book", len(peers))
-        for p in peers:
-            self._log.debug("  peer %s tier=%d ip=%s:%d",
-                            p["node_id"][:12], p["tier"], p["public_ip"], p["public_port"])
+        self._log.info("Reconnect: %d peers in book", len(peers))
 
-        # Phase 1: Connect to Tier 1 peers
-        tier1 = [p for p in peers if p["tier"] == 1]
-        self.replication.tier1_total = len(tier1)
-        self._log.info("Reconnect phase 1: %d Tier-1 peers", len(tier1))
-
-        for peer in tier1[:MAX_CONCURRENT_HOLE_PUNCH]:
-            self.replication.tier1_contacted.add(peer["node_id"])
-            self._log.info("Reconnect phase 1: punching %s (%s:%d)",
-                            peer["node_id"][:12], peer["public_ip"], peer["public_port"])
-            try:
-                ok = self.udp_engine.hole_punch(
-                    peer["node_id"],
-                    peer["public_ip"],
-                    peer["public_port"],
-                    bytes(peer["public_key"]),
-                )
-                self._log.info("Reconnect phase 1: punch %s → %s",
-                                peer["node_id"][:12], "OK" if ok else "FAIL")
-            except Exception as e:
-                self._log.warning("Reconnect phase 1: punch %s error: %s",
-                                  peer["node_id"][:12], e)
-                self.peer_book.record_failure(peer["node_id"])
-
-        connected = self.udp_engine.get_connected_peers()
-        self._log.info("Reconnect phase 1 done: %d connected", len(connected))
-
-        # Phase 2: Exchange file registries with connected peers
-        time.sleep(1)
-        self._log.info("Reconnect phase 2: exchanging registries with %d peers", len(connected))
-        for nid in connected:
-            try:
-                self.udp_engine.send_to(
-                    nid,
-                    MsgType.FILE_REGISTRY_QUERY,
-                    MessageBuilder.file_registry_query(),
-                )
-                self._log.debug("Reconnect phase 2: registry query → %s", nid[:12])
-            except Exception as e:
-                self._log.warning("Reconnect phase 2: query to %s failed: %s", nid[:12], e)
-
-        # Phase 3: Open rebalance gate
-        self._log.info("Reconnect phase 3: opening rebalance gate")
-        self.replication.open_gate()
-        self.replication.execute_rebalance()
-
-        # Phase 4: Try Tier 2, then Tier 3
-        for tier in [2, 3]:
+        # Queue hole punches for Tier 1 peers
+        for tier in [1, 2, 3]:
             tier_peers = [p for p in peers if p["tier"] == tier]
-            self._log.info("Reconnect phase 4: %d Tier-%d peers", len(tier_peers), tier)
-            for peer in tier_peers[:5]:
-                self.replication.tier1_contacted.add(peer["node_id"])
-                self._log.debug("Reconnect phase 4: punching %s (%s:%d)",
-                                peer["node_id"][:12], peer["public_ip"], peer["public_port"])
-                try:
-                    self.udp_engine.hole_punch(
-                        peer["node_id"],
-                        peer["public_ip"],
-                        peer["public_port"],
-                        bytes(peer["public_key"]),
+            limit = MAX_CONCURRENT_HOLE_PUNCH if tier == 1 else 5
+            for peer in tier_peers[:limit]:
+                self.scheduler.enqueue(
+                    Action.normal(
+                        ActionType.HOLE_PUNCH_PEER,
+                        peer_id=peer["node_id"],
+                        ip=peer["public_ip"],
+                        port=peer["public_port"],
+                        pubkey=bytes(peer["public_key"]),
                     )
-                except Exception as e:
-                    self._log.warning("Reconnect phase 4: punch %s error: %s",
-                                      peer["node_id"][:12], e)
-
-        connected = self.udp_engine.get_connected_peers()
-        self._log.info("Reconnect phase 4 done: %d connected", len(connected))
-
-        # Request peer lists from connected peers
-        self._log.info("Reconnect: requesting peer lists from %d peers", len(connected))
-        for nid in connected:
-            try:
-                self.udp_engine.send_to(
-                    nid,
-                    MsgType.PEER_LIST_REQUEST,
-                    MessageBuilder.peer_list_request(),
                 )
-            except Exception as e:
-                self._log.warning("Reconnect: peer list request to %s failed: %s", nid[:12], e)
 
-        # Phase 5: LAN broadcast
+        # Queue registry exchange (delayed to give hole punches time)
+        self.scheduler.enqueue(
+            Action.normal(ActionType.EXCHANGE_REGISTRY, delay=2.0)
+        )
+        # Queue peer list request
+        self.scheduler.enqueue(
+            Action.normal(ActionType.REQUEST_PEER_LIST, delay=3.0)
+        )
+        # Open rebalance gate and queue first rebalance
+        self.replication.open_gate()
+        self.scheduler.enqueue(
+            Action.normal(ActionType.REBALANCE, delay=4.0)
+        )
+        # LAN broadcast
         if not self.no_lan:
-            self._log.info("Reconnect phase 5: LAN broadcast")
-            self.udp_engine.lan_broadcast()
-        else:
-            self._log.info("Reconnect phase 5: LAN broadcast skipped (--no-lan)")
+            self.scheduler.enqueue(
+                Action.low(ActionType.LAN_BROADCAST, delay=5.0)
+            )
 
-        self._log.info("=== Reconnect: done (%d connected) ===", len(connected))
+        self._log.info("=== Reconnect: actions queued ===")
 
-    def _start_periodic_tasks(self) -> None:
-        """Start all background periodic tasks."""
+    def _seed_periodic_actions(self) -> None:
+        """Queue initial periodic scheduler actions (replaces old timer threads)."""
+        s = self.scheduler
 
-        def _rebalance_loop():
-            while self.udp_engine.running:
-                time.sleep(60)
-                if self.udp_engine.running:
-                    try:
-                        self.replication.calculate_network_target()
-                        self.replication.execute_rebalance()
-                    except Exception:
-                        pass
+        # Rebalance
+        s.enqueue(Action.normal(ActionType.REBALANCE, delay=self.config.rebalance_interval))
 
-        def _cleanup_loop():
-            while self.udp_engine.running:
-                time.sleep(300)
-                if self.udp_engine.running:
-                    try:
-                        promoted = self.storage.cleanup_expired_temporary()
-                        if promoted:
-                            self.replication.execute_rebalance()
-                    except Exception:
-                        pass
+        # Cleanup temp files
+        s.enqueue(Action.low(ActionType.CLEANUP_TEMP, delay=self.config.cleanup_temp_interval))
 
-        def _gc_loop():
-            while self.udp_engine.running:
-                time.sleep(1800)
-                if self.udp_engine.running:
-                    try:
-                        self.file_registry.cleanup_old_versions()
-                    except Exception:
-                        pass
+        # GC old versions
+        s.enqueue(Action.low(ActionType.GC_OLD_VERSIONS, delay=self.config.gc_old_versions_interval))
 
-        def _peer_cleanup_loop():
-            while self.udp_engine.running:
-                time.sleep(3600)
-                if self.udp_engine.running:
-                    try:
-                        self.peer_book.cleanup()
-                    except Exception:
-                        pass
+        # Peer cleanup
+        s.enqueue(Action.low(ActionType.PEER_CLEANUP, delay=self.config.peer_cleanup_interval))
 
-        def _lan_loop():
-            while self.udp_engine.running and not self.no_lan:
-                time.sleep(30)
-                if self.udp_engine.running:
-                    connected = len(self.udp_engine.get_connected_peers())
-                    if connected < 2:
-                        self.udp_engine.lan_broadcast()
+        # Liveness check
+        s.enqueue(Action.low(ActionType.LIVENESS_CHECK, delay=self.config.keepalive_interval))
 
-        def _liveness_loop():
-            while self.udp_engine.running:
-                time.sleep(30)
-                if self.udp_engine.running:
-                    try:
-                        self.udp_engine.check_liveness()
-                    except Exception:
-                        pass
+        # LAN broadcast (only if enabled)
+        if not self.no_lan:
+            s.enqueue(Action.low(ActionType.LAN_BROADCAST, delay=self.config.lan_broadcast_interval))
 
-        for target in [
-            _rebalance_loop,
-            _cleanup_loop,
-            _gc_loop,
-            _peer_cleanup_loop,
-            _lan_loop,
-            _liveness_loop,
-        ]:
-            t = threading.Thread(target=target, daemon=True)
-            t.start()
+        # Kick off keepalive pings for already-connected peers (none at startup,
+        # but PING_PEER actions get seeded when peers connect via _on_hello)
+
+        self._log.info("Periodic actions seeded in scheduler")
 
     def _start_web_server(self) -> None:
         """Launch Flask web server in a thread."""

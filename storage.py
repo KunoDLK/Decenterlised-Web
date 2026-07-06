@@ -179,6 +179,43 @@ class StorageManager:
             return True
         return False
 
+    def store_chunk(self, file_id: str, chunk_index: int, data: bytes) -> str:
+        """Write a single chunk to a temporary assembly file on disk.
+
+        Returns the path to the chunk file.
+        """
+        chunk_dir = str(Path(self.files_dir) / ".chunks" / file_id)
+        Path(chunk_dir).mkdir(parents=True, exist_ok=True)
+        chunk_path = str(Path(chunk_dir) / str(chunk_index))
+        with open(chunk_path, "wb") as f:
+            f.write(data)
+        return chunk_path
+
+    def has_chunk(self, file_id: str, chunk_index: int) -> bool:
+        """Check if a chunk is stored on disk."""
+        return os.path.isfile(
+            str(Path(self.files_dir) / ".chunks" / file_id / str(chunk_index))
+        )
+
+    def assemble_chunks(self, file_id: str, total_chunks: int) -> bytes:
+        """Assemble all chunks into a single bytes object and clean up chunk files.
+
+        Raises FileNotFoundError if any chunk is missing.
+        """
+        chunk_dir = str(Path(self.files_dir) / ".chunks" / file_id)
+        chunks: list[bytes] = []
+        for i in range(total_chunks):
+            chunk_path = str(Path(chunk_dir) / str(i))
+            if not os.path.isfile(chunk_path):
+                raise FileNotFoundError(f"Missing chunk {i} for {file_id}")
+            with open(chunk_path, "rb") as f:
+                chunks.append(f.read())
+        data = b"".join(chunks)
+        # Clean up chunk files
+        import shutil
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        return data
+
     # ------------------------------------------------------------------
     # Quota
     # ------------------------------------------------------------------

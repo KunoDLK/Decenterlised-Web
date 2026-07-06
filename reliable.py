@@ -1,8 +1,9 @@
 """
-reliable.py — Reliability Layer
+reliable.py — Reliability Layer (Scheduler-Integrated)
 
-Sequence number tracking, ACK generation, retransmit timers.
-Sits between protocol.py and udp_engine.py.
+Sequence number tracking, ACK tracking, duplicate detection.
+Retransmit is event-driven: track_sent() returns an expiry time so the
+caller can queue a CHECK_RETRANSMIT action.  No polling needed.
 """
 
 from __future__ import annotations
@@ -11,17 +12,12 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-ACK_TIMEOUT: float = 0.5
-MAX_RETRIES: int = 5
-SLIDING_WINDOW_SIZE: int = 256
-
 # Message types requiring ACK (reliable delivery)
+# ---------------------------------------------------------------------------
+
 RELIABLE_MSG_TYPES: frozenset[int] = frozenset(
     {
         0x31,  # FILE_CHUNK
@@ -36,17 +32,16 @@ RELIABLE_MSG_TYPES: frozenset[int] = frozenset(
     }
 )
 
-ACK_MSG_TYPE: int = 0x03
+SLIDING_WINDOW_SIZE: int = 256
 
-
-# ---------------------------------------------------------------------------
+# ===================================================================
 # PendingMessage
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 
 @dataclass
 class PendingMessage:
-    """Message awaiting ACK from peer."""
+    """Message awaiting ACK from a peer."""
 
     peer_id: str
     seq_num: int
@@ -57,35 +52,42 @@ class PendingMessage:
     created_at: float = field(default_factory=time.monotonic)
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # ReliabilityManager
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 
 class ReliabilityManager:
-    """Per-udp_engine singleton managing sequence numbers & pending ACKs."""
+    """Manages sequence numbers, duplicate detection, and pending ACKs.
+
+    Does NOT poll or spawn threads.  The caller queues scheduler actions
+    based on the expiry times returned by track_sent().
+    """
 
     def __init__(
         self,
-        on_retry_failed: Optional[Callable[[PendingMessage], None]] = None,
+        ack_timeout: float = 0.5,
+        max_retries: int = 5,
+        ack_timeout_max: float = 4.0,
+        ack_timeout_multiplier: float = 2.0,
     ) -> None:
+        self._ack_timeout = ack_timeout
+        self._max_retries = max_retries
+        self._ack_timeout_max = ack_timeout_max
+        self._ack_timeout_multiplier = ack_timeout_multiplier
         self._lock = threading.Lock()
 
-        # (peer_id, seq_num) -> PendingMessage
+        # (peer_id, seq_num) → PendingMessage
         self.pending_acks: dict[tuple[str, int], PendingMessage] = {}
 
         # Next outgoing seq_num per peer
         self.peer_seq_out: dict[str, int] = {}
 
-        # Last received seq_num per peer
+        # Last received seq_num per peer (for duplicate detection)
         self.peer_seq_in: dict[str, int] = {}
 
         # Sliding window of received seq_nums per peer
         self.received_seqs: dict[str, set[int]] = {}
-
-        self.on_retry_failed: Callable[[PendingMessage], None] = (
-            on_retry_failed if on_retry_failed is not None else lambda _msg: None
-        )
 
     # ------------------------------------------------------------------
     # Sequence numbers
@@ -131,15 +133,21 @@ class ReliabilityManager:
         return False
 
     # ------------------------------------------------------------------
-    # ACK tracking
+    # ACK tracking — event-driven
     # ------------------------------------------------------------------
 
-    def track_pending(
-        self, peer_id: str, seq_num: int, payload: bytes, msg_type: int, critical: bool
-    ) -> None:
-        """Store message in pending_acks if critical (requires ACK)."""
-        if not critical:
-            return
+    def track_sent(
+        self, peer_id: str, seq_num: int, payload: bytes, msg_type: int
+    ) -> Optional[float]:
+        """Record a sent message that needs an ACK.
+
+        Returns the expiry time (monotonic) when a retransmit check should
+        fire, or None if the message type doesn't need ACKs.
+        """
+        if not self.needs_ack(msg_type):
+            return None
+
+        expiry = time.monotonic() + self._ack_timeout
         with self._lock:
             self.pending_acks[(peer_id, seq_num)] = PendingMessage(
                 peer_id=peer_id,
@@ -147,38 +155,69 @@ class ReliabilityManager:
                 payload=payload,
                 msg_type=msg_type,
                 retry_count=0,
-                expiry=time.monotonic() + ACK_TIMEOUT,
+                expiry=expiry,
             )
+        return expiry
 
-    def ack_received(self, peer_id: str, seq_num: int) -> None:
-        """Remove from pending_acks when ACK arrives."""
+    def ack_received(self, peer_id: str, seq_num: int) -> bool:
+        """Record an ACK. Returns True if this cancelled a pending retransmit."""
+        with self._lock:
+            removed = self.pending_acks.pop((peer_id, seq_num), None)
+        return removed is not None
+
+    def get_pending(
+        self, peer_id: str, seq_num: int
+    ) -> Optional[PendingMessage]:
+        """Get a pending message by (peer_id, seq_num)."""
+        with self._lock:
+            return self.pending_acks.get((peer_id, seq_num))
+
+    def mark_retry(
+        self, peer_id: str, seq_num: int
+    ) -> tuple[Optional[PendingMessage], Optional[float]]:
+        """Increment retry count for a pending message.
+
+        Returns (msg, new_expiry) where:
+        - msg is None if already removed or max retries exceeded
+        - new_expiry is the time for the next retransmit check, or None if
+          max retries exceeded (caller should give up)
+        """
+        with self._lock:
+            msg = self.pending_acks.get((peer_id, seq_num))
+            if msg is None:
+                return (None, None)
+
+            msg.retry_count += 1
+            if msg.retry_count >= self._max_retries:
+                self.pending_acks.pop((peer_id, seq_num), None)
+                return (None, None)  # give up
+
+            # Exponential backoff: ack_timeout * multiplier^retry_count, capped
+            backoff = self._ack_timeout * (
+                self._ack_timeout_multiplier ** msg.retry_count
+            )
+            msg.expiry = time.monotonic() + min(backoff, self._ack_timeout_max)
+            return (msg, msg.expiry)
+
+    def discard(self, peer_id: str, seq_num: int) -> None:
+        """Explicitly discard a pending message."""
         with self._lock:
             self.pending_acks.pop((peer_id, seq_num), None)
 
-    def get_expired(self) -> list[PendingMessage]:
-        """Return messages whose ACK timer expired, increment retry count.
-
-        If retries >= MAX_RETRIES, calls on_retry_failed callback.
-        """
-        now = time.monotonic()
-        expired: list[PendingMessage] = []
-        to_remove: list[tuple[str, int]] = []
-
+    def discard_all_for_peer(self, peer_id: str) -> int:
+        """Remove all pending messages for a peer. Returns count removed."""
         with self._lock:
-            for key, msg in self.pending_acks.items():
-                if msg.expiry <= now:
-                    msg.retry_count += 1
-                    if msg.retry_count >= MAX_RETRIES:
-                        to_remove.append(key)
-                        self.on_retry_failed(msg)
-                    else:
-                        msg.expiry = now + ACK_TIMEOUT
-                        expired.append(msg)
+            to_remove = [
+                k for k in self.pending_acks if k[0] == peer_id
+            ]
+            for k in to_remove:
+                self.pending_acks.pop(k, None)
+        return len(to_remove)
 
-            for key in to_remove:
-                self.pending_acks.pop(key, None)
-
-        return expired
+    def pending_count(self) -> int:
+        """Number of messages awaiting ACK."""
+        with self._lock:
+            return len(self.pending_acks)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -190,6 +229,7 @@ class ReliabilityManager:
         return msg_type in RELIABLE_MSG_TYPES
 
     @staticmethod
-    def build_ack(peer_id: str, acked_msg_type: int, ack_seq: int) -> bytes:
+    def build_ack(acked_msg_type: int, ack_seq: int) -> bytes:
         """Build ACK payload: [2B acked_msg_type][4B ack_seq_num]."""
         return struct.pack(">H I", acked_msg_type, ack_seq)
+

@@ -1,7 +1,9 @@
 """
 peer_book.py — SQLite Peer Directory
 
-Persistent directory of all known peers with tiering, last-seen tracking, cleanup.
+Persistent directory of all known peers with tiering, last-seen tracking,
+connection state management, and cleanup.  All per-peer connection state
+that was formerly held in-memory (ConnectionState dataclass) now lives here.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from file_registry import FileRegistry
@@ -25,6 +27,11 @@ _log = logging.getLogger("peers")
 TIER_2_RECENT_DAYS: int = 7
 CONSECUTIVE_FAILS_DEMOTE: int = 5
 PEER_BOOK_CLEANUP_DAYS: int = 30
+MAX_HOLE_PUNCH_ATTEMPTS: int = 5
+
+ConnectionStateLiteral = Literal[
+    "PUNCHING", "CONNECTED", "ASSISTED", "DISCONNECTED", "UNREACHABLE"
+]
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +40,10 @@ PEER_BOOK_CLEANUP_DAYS: int = 30
 
 
 class PeerBook:
-    """SQLite-backed peer directory with tier-based prioritisation."""
+    """SQLite-backed peer directory with tier-based prioritisation.
+
+    Also manages per-peer connection state (formerly ConnectionState dataclass).
+    """
 
     def __init__(self, data_dir: str) -> None:
         self.db_path = str(Path(data_dir) / "peers.db")
@@ -55,7 +65,13 @@ class PeerBook:
                     tier            INTEGER NOT NULL DEFAULT 3,
                     consecutive_fails INTEGER DEFAULT 0,
                     first_seen      REAL NOT NULL,
-                    is_bootstrap    INTEGER DEFAULT 0
+                    is_bootstrap    INTEGER DEFAULT 0,
+                    state           TEXT NOT NULL DEFAULT 'DISCONNECTED',
+                    address_ip      TEXT NOT NULL DEFAULT '',
+                    address_port    INTEGER NOT NULL DEFAULT 0,
+                    last_ping_sent  REAL NOT NULL DEFAULT 0,
+                    hole_punch_attempts INTEGER NOT NULL DEFAULT 0,
+                    direct_blocked  INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -65,12 +81,170 @@ class PeerBook:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_peers_state ON peers(state)"
+            )
             conn.commit()
+
+        # Migrate existing databases that lack the new columns
+        self._migrate_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _migrate_schema(self) -> None:
+        """Add new columns if they don't exist (idempotent)."""
+        new_columns = {
+            "state": "TEXT NOT NULL DEFAULT 'DISCONNECTED'",
+            "address_ip": "TEXT NOT NULL DEFAULT ''",
+            "address_port": "INTEGER NOT NULL DEFAULT 0",
+            "last_ping_sent": "REAL NOT NULL DEFAULT 0",
+            "hole_punch_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "direct_blocked": "INTEGER NOT NULL DEFAULT 0",
+        }
+        with self._lock:
+            with self._get_conn() as conn:
+                existing = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(peers)").fetchall()
+                }
+                for col_name, col_def in new_columns.items():
+                    if col_name not in existing:
+                        try:
+                            conn.execute(
+                                f"ALTER TABLE peers ADD COLUMN {col_name} {col_def}"
+                            )
+                            _log.info("Migrated peers table: added column %s", col_name)
+                        except sqlite3.OperationalError:
+                            pass  # already exists
+                conn.commit()
+
+    # ------------------------------------------------------------------
+    # Connection state management (replaces connection.py)
+    # ------------------------------------------------------------------
+
+    def set_connection_state(
+        self,
+        node_id: str,
+        state: ConnectionStateLiteral,
+        address_ip: str = "",
+        address_port: int = 0,
+    ) -> None:
+        """Set the connection state and optional address for a peer."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                if address_ip:
+                    conn.execute(
+                        """UPDATE peers SET state=?, last_seen=?, address_ip=?, address_port=?
+                           WHERE node_id=?""",
+                        (state, now, address_ip, address_port, node_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE peers SET state=?, last_seen=? WHERE node_id=?",
+                        (state, now, node_id),
+                    )
+                conn.commit()
+        _log.debug("Peer %s state → %s", node_id[:12], state)
+
+    def get_connection_state(self, node_id: str) -> Optional[dict[str, Any]]:
+        """Get connection-related fields for a peer."""
+        row = self.get(node_id)
+        if row is None:
+            return None
+        return {
+            "node_id": row["node_id"],
+            "state": row["state"],
+            "address_ip": row["address_ip"],
+            "address_port": row["address_port"],
+            "last_seen": row["last_seen"],
+            "last_ping_sent": row["last_ping_sent"],
+            "hole_punch_attempts": row["hole_punch_attempts"],
+            "direct_blocked": bool(row["direct_blocked"]),
+            "public_key": bytes(row["public_key"]),
+        }
+
+    def get_connected_peers(self) -> list[str]:
+        """Return node_ids of all peers with state='CONNECTED'."""
+        with self._lock:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT node_id FROM peers WHERE state='CONNECTED'"
+                ).fetchall()
+        return [r["node_id"] for r in rows]
+
+    def is_connected(self, node_id: str) -> bool:
+        """Check if a peer is in CONNECTED state."""
+        row = self.get_connection_state(node_id)
+        return row is not None and row["state"] == "CONNECTED"
+
+    def is_alive(self, node_id: str, timeout: float = 90.0) -> bool:
+        """True if last_seen is within timeout seconds."""
+        row = self.get(node_id)
+        if row is None:
+            return False
+        return (time.time() - row["last_seen"]) <= timeout
+
+    def record_ping_sent(self, node_id: str) -> None:
+        """Record that a PING was sent to this peer."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE peers SET last_ping_sent=? WHERE node_id=?",
+                    (now, node_id),
+                )
+                conn.commit()
+
+    def record_ping_received(self, node_id: str) -> None:
+        """Record that a response was received (updates last_seen)."""
+        self.mark_seen(node_id)
+
+    def set_connection_address(
+        self, node_id: str, ip: str, port: int
+    ) -> None:
+        """Update the last-known address for a peer."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE peers SET address_ip=?, address_port=? WHERE node_id=?",
+                    (ip, port, node_id),
+                )
+                conn.commit()
+
+    def increment_hole_punch_attempts(self, node_id: str) -> bool:
+        """Increment hole punch attempts. Returns True if now direct_blocked."""
+        with self._lock:
+            with self._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT hole_punch_attempts FROM peers WHERE node_id=?",
+                    (node_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                attempts = row["hole_punch_attempts"] + 1
+                blocked = 1 if attempts >= MAX_HOLE_PUNCH_ATTEMPTS else 0
+                state = "UNREACHABLE" if blocked else "DISCONNECTED"
+                conn.execute(
+                    """UPDATE peers SET hole_punch_attempts=?, direct_blocked=?,
+                       state=? WHERE node_id=?""",
+                    (attempts, blocked, state, node_id),
+                )
+                conn.commit()
+                return blocked == 1
+
+    def resolve_node_id(self, addr: tuple[str, int]) -> Optional[str]:
+        """Resolve (ip, port) to node_id via last-known address."""
+        with self._lock:
+            with self._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT node_id FROM peers WHERE address_ip=? AND address_port=?",
+                    (addr[0], addr[1]),
+                ).fetchone()
+        return row["node_id"] if row else None
 
     # ------------------------------------------------------------------
     # CRUD

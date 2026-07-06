@@ -69,6 +69,35 @@ class FileRegistry:
                 )
                 """
             )
+            # ---- Transfers table (replaces UploadState/DownloadState) ----
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transfers (
+                    transfer_id     TEXT PRIMARY KEY,
+                    file_id         TEXT NOT NULL,
+                    peer_id         TEXT NOT NULL,
+                    direction       TEXT NOT NULL DEFAULT 'download',
+                    total_chunks    INTEGER NOT NULL DEFAULT 0,
+                    current_chunk   INTEGER NOT NULL DEFAULT 0,
+                    state           TEXT NOT NULL DEFAULT 'active',
+                    created_at      REAL NOT NULL,
+                    completed_at    REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transfer_chunks (
+                    transfer_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    received    INTEGER NOT NULL DEFAULT 0,
+                    sent_at     REAL,
+                    acked_at    REAL,
+                    retries     INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (transfer_id, chunk_index)
+                )
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_files_author ON files(author_id)"
             )
@@ -77,6 +106,12 @@ class FileRegistry:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfers_file ON transfers(file_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfers_peer ON transfers(peer_id)"
             )
             conn.commit()
 
@@ -327,6 +362,139 @@ class FileRegistry:
         return AuthorIdentity.verify(
             signed_data, entry.author_signature, entry.author_public_key
         )
+
+    # ------------------------------------------------------------------
+    # Transfer management (replaces UploadState / DownloadState in udp_engine)
+    # ------------------------------------------------------------------
+
+    def create_transfer(
+        self,
+        transfer_id: str,
+        file_id: str,
+        peer_id: str,
+        direction: str = "download",
+        total_chunks: int = 0,
+    ) -> None:
+        """Create a new transfer record."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO transfers
+                       (transfer_id, file_id, peer_id, direction, total_chunks,
+                        current_chunk, state, created_at)
+                       VALUES (?, ?, ?, ?, ?, 0, 'active', ?)""",
+                    (transfer_id, file_id, peer_id, direction, total_chunks, now),
+                )
+                conn.commit()
+
+    def get_transfer(self, transfer_id: str) -> Optional[dict]:
+        """Get a transfer record."""
+        with self._lock:
+            with self._get_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM transfers WHERE transfer_id=?",
+                    (transfer_id,),
+                ).fetchone()
+        return dict(row) if row else None
+
+    def update_transfer_progress(
+        self, transfer_id: str, chunk_index: int, total_chunks: int
+    ) -> None:
+        """Record a received chunk and update progress."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO transfer_chunks
+                       (transfer_id, chunk_index, received, sent_at)
+                       VALUES (?, ?, 1, ?)""",
+                    (transfer_id, chunk_index, now),
+                )
+                conn.execute(
+                    """UPDATE transfers SET total_chunks=MAX(total_chunks, ?),
+                       current_chunk=? WHERE transfer_id=?""",
+                    (total_chunks, chunk_index + 1, transfer_id),
+                )
+                conn.commit()
+
+    def get_transfer_progress(self, transfer_id: str) -> tuple[int, int, set[int]]:
+        """Return (total_chunks, current_chunk, set of received chunk indices)."""
+        with self._lock:
+            with self._get_conn() as conn:
+                t = conn.execute(
+                    "SELECT total_chunks, current_chunk FROM transfers WHERE transfer_id=?",
+                    (transfer_id,),
+                ).fetchone()
+                if t is None:
+                    return (0, 0, set())
+                chunks = conn.execute(
+                    "SELECT chunk_index FROM transfer_chunks WHERE transfer_id=? AND received=1",
+                    (transfer_id,),
+                ).fetchall()
+        received = {c["chunk_index"] for c in chunks}
+        return (t["total_chunks"], t["current_chunk"], received)
+
+    def is_transfer_complete(self, transfer_id: str) -> bool:
+        """Check if all chunks have been received."""
+        total, _, received = self.get_transfer_progress(transfer_id)
+        return total > 0 and len(received) >= total
+
+    def mark_transfer_complete(self, transfer_id: str) -> None:
+        """Mark a transfer as complete."""
+        now = time.time()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE transfers SET state='complete', completed_at=? WHERE transfer_id=?",
+                    (now, transfer_id),
+                )
+                conn.commit()
+
+    def mark_transfer_failed(self, transfer_id: str) -> None:
+        """Mark a transfer as failed."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE transfers SET state='failed' WHERE transfer_id=?",
+                    (transfer_id,),
+                )
+                conn.commit()
+
+    def increment_chunk_retry(self, transfer_id: str, chunk_index: int) -> int:
+        """Increment retry count for a chunk. Returns new count."""
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT INTO transfer_chunks (transfer_id, chunk_index, received, retries)
+                       VALUES (?, ?, 0, 1)
+                       ON CONFLICT(transfer_id, chunk_index) DO UPDATE SET
+                       retries=transfer_chunks.retries + 1""",
+                    (transfer_id, chunk_index),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT retries FROM transfer_chunks WHERE transfer_id=? AND chunk_index=?",
+                    (transfer_id, chunk_index),
+                ).fetchone()
+        return row["retries"] if row else 0
+
+    def cleanup_transfers(self, max_age: float = 3600) -> int:
+        """Remove old transfer records. Returns count removed."""
+        cutoff = time.time() - max_age
+        with self._lock:
+            with self._get_conn() as conn:
+                c1 = conn.execute(
+                    "DELETE FROM transfer_chunks WHERE transfer_id IN "
+                    "(SELECT transfer_id FROM transfers WHERE created_at < ?)",
+                    (cutoff,),
+                )
+                c2 = conn.execute(
+                    "DELETE FROM transfers WHERE created_at < ?",
+                    (cutoff,),
+                )
+                conn.commit()
+        return c2.rowcount
 
     # ------------------------------------------------------------------
     # Maintenance

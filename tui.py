@@ -385,8 +385,8 @@ class TUI:
         if not peers:
             table.add_row("(none)", "")
         for nid in peers[:20]:
-            conn = self.node.udp_engine.connections.get(nid)
-            table.add_row(nid[:8] + "...", "🟢" if (conn and conn.is_connected) else "🟡")
+            cs = self.node.peer_book.get_connection_state(nid)
+            table.add_row(nid[:8] + "...", "🟢" if (cs and cs["state"] == "CONNECTED") else "🟡")
         return Panel(table, title="Peers", border_style="blue")
 
     def _render_footer(self) -> Panel:

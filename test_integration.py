@@ -97,6 +97,11 @@ class IntegrationTest:
         self.node1 = App(args1)
         self.node1.login(self.username, self.password)
         self.node1.udp_engine.start()
+        # Start the scheduler so queued actions (HELLO replies, hole punches, etc.) are processed
+        self._scheduler_thread_1 = threading.Thread(
+            target=self.node1.scheduler.run, daemon=True, name="sched-1"
+        )
+        self._scheduler_thread_1.start()
         self._log(f"  Node 1 ID: {self.node1.node_identity.node_id}")
         self._log(f"  Node 1 addr: {self.node1.udp_engine.public_ip}:{self.node1.udp_engine.public_port}")
 
@@ -104,6 +109,10 @@ class IntegrationTest:
         self.node2 = App(args2)
         self.node2.login(self.username, self.password)
         self.node2.udp_engine.start()
+        self._scheduler_thread_2 = threading.Thread(
+            target=self.node2.scheduler.run, daemon=True, name="sched-2"
+        )
+        self._scheduler_thread_2.start()
         self._log(f"  Node 2 ID: {self.node2.node_identity.node_id}")
         self._log(f"  Node 2 addr: {self.node2.udp_engine.public_ip}:{self.node2.udp_engine.public_port}")
 
@@ -111,10 +120,18 @@ class IntegrationTest:
         """Stop instances and clean up temp dirs."""
         if self.node1:
             try:
+                self.node1.scheduler.stop()
+            except Exception:
+                pass
+            try:
                 self.node1.udp_engine.stop()
             except Exception:
                 pass
         if self.node2:
+            try:
+                self.node2.scheduler.stop()
+            except Exception:
+                pass
             try:
                 self.node2.udp_engine.stop()
             except Exception:
@@ -133,7 +150,7 @@ class IntegrationTest:
         return argparse.Namespace(
             user=self.username,
             password=self.password,
-            port=port - tui_offset,  # tui_port_offset will be added back
+            port=port - tui_offset,
             no_tui=True,
             web_port=web_port,
             web_host="127.0.0.1",
@@ -141,6 +158,8 @@ class IntegrationTest:
             storage_limit=storage_mb,
             no_lan=True,
             tui_port_offset=tui_offset,
+            log=None,
+            udp_trace=None,
         )
 
     # ------------------------------------------------------------------
@@ -271,10 +290,10 @@ class IntegrationTest:
         self._assert(connected, "Both nodes see each other as connected")
 
         # Verify connection state
-        conn = n1.udp_engine.connections.get(n2_id)
-        self._assert(conn is not None, "Node 1 has connection state for Node 2")
-        if conn:
-            self._assert(conn.is_connected, "Connection state is CONNECTED")
+        cs = n1.peer_book.get_connection_state(n2_id)
+        self._assert(cs is not None, "Node 1 has connection state for Node 2")
+        if cs:
+            self._assert(cs["state"] == "CONNECTED", "Connection state is CONNECTED")
 
         # Verify peer book entries
         pb1 = n1.peer_book.get(n2_id)

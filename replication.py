@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from storage import StorageManager
     from peer_book import PeerBook
     from udp_engine import UDPEngine
+    from scheduler import Scheduler
 
 _log = logging.getLogger("replication")
 
@@ -42,11 +43,13 @@ class ReplicationManager:
         storage: "StorageManager",
         peer_book: "PeerBook",
         udp_engine: "UDPEngine",
+        scheduler: "Scheduler" = None,
     ) -> None:
         self.file_registry = file_registry
         self.storage = storage
         self.peer_book = peer_book
         self.udp_engine = udp_engine
+        self.scheduler = scheduler
         self.rebalance_gate: bool = False
         self.estimated_network_target: int = 3
         self.received_targets: list[int] = []
@@ -309,8 +312,8 @@ class ReplicationManager:
             MsgType.REPLICATION_SOLICIT, MessageBuilder.replication_solicit(payload)
         )
 
-    def consider_solicit(self, payload: ReplicationSolicitPayload) -> bool:
-        """Consider a replication solicitation. Returns True if accepting."""
+    def can_accept_solicit(self, payload: ReplicationSolicitPayload) -> bool:
+        """Check if we can accept a replication solicitation. Does NOT download."""
         if self.storage.has_file(payload.file_id):
             return False
         available = self.storage.available_bytes()
@@ -318,14 +321,16 @@ class ReplicationManager:
             _log.debug("Replication solicit %s rejected: need %d, have %d",
                         payload.file_id[:12], payload.file_size, available)
             return False
-        # Accept — download and store
-        _log.info("Accepting replication solicit: %s (%d bytes)", payload.file_id[:12], payload.file_size)
-        data = self.udp_engine.download_file(payload.file_id)
-        self.storage.store_replica(payload.file_id, data)
-        self.file_registry.increment_replica(
-            payload.file_id, self.file_registry.node_id
-        )
         return True
+
+    def consider_solicit(self, payload: ReplicationSolicitPayload) -> bool:
+        """Consider a replication solicitation. Returns True if accepting.
+
+        NOTE: This method does NOT download anymore — the caller (app.py)
+        should use can_accept_solicit() + download via scheduler.
+        Kept for backward compatibility with tests.
+        """
+        return self.can_accept_solicit(payload)
 
     def on_peer_disconnected(self, node_id: str) -> None:
         """Handle peer disconnection: remove replicas, trigger rebalance."""

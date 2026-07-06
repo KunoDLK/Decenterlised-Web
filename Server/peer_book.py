@@ -216,23 +216,34 @@ class PeerBook:
                 conn.commit()
 
     def increment_hole_punch_attempts(self, node_id: str) -> bool:
-        """Increment hole punch attempts. Returns True if now direct_blocked."""
+        """Increment hole punch attempts. Returns True if now direct_blocked.
+
+        Only demotes state if currently PUNCHING — never overrides CONNECTED.
+        """
         with self._lock:
             with self._get_conn() as conn:
                 row = conn.execute(
-                    "SELECT hole_punch_attempts FROM peers WHERE node_id=?",
+                    "SELECT hole_punch_attempts, state FROM peers WHERE node_id=?",
                     (node_id,),
                 ).fetchone()
                 if row is None:
                     return False
                 attempts = row["hole_punch_attempts"] + 1
                 blocked = 1 if attempts >= MAX_HOLE_PUNCH_ATTEMPTS else 0
-                state = "UNREACHABLE" if blocked else "DISCONNECTED"
-                conn.execute(
-                    """UPDATE peers SET hole_punch_attempts=?, direct_blocked=?,
-                       state=? WHERE node_id=?""",
-                    (attempts, blocked, state, node_id),
-                )
+                # Only demote state if still PUNCHING (preserve CONNECTED from HELLO reply)
+                if row["state"] == "PUNCHING":
+                    new_state = "UNREACHABLE" if blocked else "DISCONNECTED"
+                    conn.execute(
+                        """UPDATE peers SET hole_punch_attempts=?, direct_blocked=?,
+                           state=? WHERE node_id=?""",
+                        (attempts, blocked, new_state, node_id),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE peers SET hole_punch_attempts=?, direct_blocked=?
+                           WHERE node_id=?""",
+                        (attempts, blocked, node_id),
+                    )
                 conn.commit()
                 return blocked == 1
 
@@ -335,6 +346,23 @@ class PeerBook:
                 conn.execute(
                     "UPDATE peers SET last_seen = ?, consecutive_fails = 0 WHERE node_id = ?",
                     (now, node_id),
+                )
+                conn.commit()
+
+    def cleanup_placeholder(
+        self, ip: str, port: int, real_node_id: str
+    ) -> None:
+        """Remove placeholder peers at (ip, port) that aren't the real peer.
+
+        Placeholders have empty public_key (b''), created during loopback discovery.
+        """
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """DELETE FROM peers
+                       WHERE public_ip = ? AND public_port = ?
+                         AND public_key = X'' AND node_id != ?""",
+                    (ip, port, real_node_id),
                 )
                 conn.commit()
 

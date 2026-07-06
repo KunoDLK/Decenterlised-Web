@@ -226,7 +226,9 @@ class Scheduler:
             self._pending[action.action_id] = action
             heap_size = len(self._heap)
         if self.debug:
-            _log.debug("ENQ %s  (heap=%d pending=%d)", action, heap_size, len(self._pending))
+            _log.debug("QUEUE %-32s → %s  (heap=%d pending=%d)",
+                       action.action_type, _summarise_params(action.params),
+                       heap_size, len(self._pending))
         self._wake_event.set()
         return action.action_id
 
@@ -237,10 +239,10 @@ class Scheduler:
         """
         action.scheduled_at = 0
         action.priority = Priority.CRITICAL
-        aid = self.enqueue(action)
         if self.debug:
-            _log.debug("ENQ-FRONT %s", action)
-        return aid
+            _log.debug("QUEUE-FRONT %-32s → %s",
+                       action.action_type, _summarise_params(action.params))
+        return self.enqueue(action)
 
     def cancel(self, action_id: str) -> bool:
         """Cancel a pending action by ID. Returns True if found.
@@ -254,7 +256,8 @@ class Scheduler:
                 self._cancelled.add(action_id)
                 self._pending.pop(action_id, None)
                 if self.debug:
-                    _log.debug("CANCEL %s", action)
+                    _log.debug("CANCEL %-32s → %s",
+                               action.action_type, _summarise_params(action.params))
                 return True
         return False
 
@@ -282,7 +285,7 @@ class Scheduler:
                 self._pending.pop(aid, None)
                 count += 1
         if self.debug and count > 0:
-            _log.debug("CANCEL-TYPE %s x%d  (match=%s)", action_type, count,
+            _log.debug("CANCEL-TYPE %-32s x%d  (match=%s)", action_type, count,
                        _summarise_params(match_params or {}))
         return count
 
@@ -328,8 +331,9 @@ class Scheduler:
             executed += 1
 
         if self.debug and executed > 0:
-            _log.debug("TICK #%d  executed=%d  heap=%d",
-                       self._tick_count, executed, len(self._heap))
+            _log.debug("TICK #%-5d | exec=%-2d | heap=%-3d | pending=%-3d",
+                       self._tick_count, executed, len(self._heap),
+                       len(self._pending))
 
         # Wait for next action or wake signal
         if not self.running:
@@ -352,11 +356,12 @@ class Scheduler:
                 if action.action_id in self._cancelled:
                     self._cancelled.discard(action.action_id)
                     if self.debug:
-                        _log.debug("DEQ-SKIP (cancelled) %s", action)
+                        _log.debug("DEQ-SKIP (cancelled) %-32s", action.action_type)
                     continue
                 self._pending.pop(action.action_id, None)
                 if self.debug:
-                    _log.debug("DEQ %s", action)
+                    _log.debug("DEQUEUE %-32s → %s",
+                               action.action_type, _summarise_params(action.params))
                 return action
         return None
 
@@ -374,7 +379,8 @@ class Scheduler:
             _log.warning("No handler for action type: %s", action.action_type)
             return
         if self.debug:
-            _log.debug("EXEC %s", action)
+            _log.debug("RUN     %-32s → %s",
+                       action.action_type, _summarise_params(action.params))
         try:
             handler(action)
         except Exception:

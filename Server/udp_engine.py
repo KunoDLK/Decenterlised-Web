@@ -24,7 +24,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 import log_utils
 import wire
-from protocol import MsgType, MessageBuilder, MessageParser, HelloPayload, GoodbyePayload
+from protocol import MsgType, MessageBuilder, MessageParser, HelloPayload, GoodbyePayload, AckPayload
 
 if TYPE_CHECKING:
     from reliable import ReliabilityManager
@@ -63,7 +63,7 @@ class UDPEngine:
         scheduler: "Scheduler",
         max_chunk_size: int = 8192,
     ) -> None:
-        self.port = port
+        self.base_port = port
         self.node_identity = node_identity
         self.reliable = reliable
         self.peer_book = peer_book
@@ -71,14 +71,34 @@ class UDPEngine:
         self.max_chunk_size = max_chunk_size
         self._log = logging.getLogger("udp")
 
+        # Update timestamps for keepalive data-freshness (set by App)
+        self.last_registry_update: float = 0.0
+        self.last_peer_update: float = 0.0
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
-        self.sock.bind(("0.0.0.0", port))
+
+        # Auto-increment port if busy (same-PC multi-instance support)
+        self.skipped_ports: list[int] = []
+        actual_port = port
+        for offset in range(100):
+            try:
+                self.sock.bind(("0.0.0.0", actual_port))
+                break
+            except OSError:
+                if offset == 0:
+                    self._log.info("Port %d busy, searching for free port...", actual_port)
+                self.skipped_ports.append(actual_port)
+                actual_port += 1
+        else:
+            raise RuntimeError(f"No free UDP port in range {port}-{port+99}")
+        self.port = actual_port
 
         self.public_ip: str = "0.0.0.0"
-        self.public_port: int = port
+        self.public_port: int = self.port
         self.uptime_since: float = time.time()
 
         self.running: bool = False
@@ -172,6 +192,26 @@ class UDPEngine:
                 # Dispatch to registered handler
                 if self._on_packet:
                     self._on_packet(wm, addr, self)
+
+                # Auto-ACK reliable messages to clear retransmit entries
+                if self.reliable.needs_ack(wm.msg_type):
+                    prefix = wm.sender_id_prefix.hex()
+                    sender_node_id = self._addr_cache.get(addr, prefix)
+                    ack_payload = MessageBuilder.ack(AckPayload(
+                        acked_msg_type=wm.msg_type,
+                        ack_seq_num=wm.seq_num,
+                    ))
+                    ack_encoded = wire.encode(
+                        wire.PROTOCOL_VERSION,
+                        MsgType.ACK,
+                        self.node_identity.node_id,
+                        0,
+                        ack_payload,
+                    )
+                    try:
+                        self.sock.sendto(ack_encoded, addr)
+                    except Exception:
+                        pass
 
                 # Signal scheduler to process any queued actions
                 self.scheduler.wake()
@@ -272,7 +312,8 @@ class UDPEngine:
             return cached
         return self.peer_book.resolve_node_id(addr)
 
-    def _build_hello_payload(self) -> HelloPayload:
+    def _build_hello_payload(self, last_registry_update: float = 0.0,
+                             last_peer_update: float = 0.0) -> HelloPayload:
         """Build a signed HelloPayload for this node."""
         pb = wire.PayloadBuilder()
         pb.add_string(self.node_identity.node_id)
@@ -288,12 +329,16 @@ class UDPEngine:
         )
         sig = self.node_identity.sign(sign_data)
         pb.add_fixed_bytes(sig)
+        pb.add_uint64(int(last_registry_update * 1_000_000))
+        pb.add_uint64(int(last_peer_update * 1_000_000))
         return MessageParser.hello(pb.build())
 
     def lan_broadcast(self) -> None:
-        """Send hello to 255.255.255.255:port."""
+        """Send hello to 255.255.255.255 on own port."""
         try:
-            hello_payload = MessageBuilder.hello(self._build_hello_payload())
+            hello_payload = MessageBuilder.hello(
+                self._build_hello_payload(self.last_registry_update, self.last_peer_update)
+            )
             encoded = wire.encode(
                 wire.PROTOCOL_VERSION,
                 MsgType.HELLO,

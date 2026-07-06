@@ -5,6 +5,7 @@ Silent on subsequent runs — just launches straight away.
 """
 
 import os
+import signal
 import sys
 import subprocess
 import platform
@@ -102,7 +103,26 @@ def main():
     # ── Launch the main application ────────────────────────────────────
     os.chdir(PROJECT_ROOT)
     sys.stdout.flush()
-    subprocess.run([python_exe, MAIN_APP] + sys.argv[1:])
+
+    proc = subprocess.Popen([python_exe, MAIN_APP] + sys.argv[1:])
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        """Forward termination signal to the child process."""
+        proc.terminate()
+
+    prev_sigint = signal.signal(signal.SIGINT, _handle_signal)
+    prev_sigterm = signal.signal(signal.SIGTERM, _handle_signal)
+
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait()
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+
+    sys.exit(proc.returncode)
 
 
 if __name__ == "__main__":

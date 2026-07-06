@@ -23,7 +23,7 @@ class PeerConfig:
     """
 
     # ---- Network ----
-    udp_port: int = 9000
+    udp_port: int = 32128
     web_port: int = 0  # 0 = disabled
     web_host: str = "127.0.0.1"
     no_tui: bool = False

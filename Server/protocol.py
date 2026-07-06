@@ -66,11 +66,15 @@ class HelloPayload:
     public_port: int
     uptime_since: float
     signature: bytes  # 64 bytes
+    last_registry_update: float = 0.0  # epoch seconds of last registry change
+    last_peer_update: float = 0.0      # epoch seconds of last peer list change
 
 
 @dataclass
 class PingPayload:
     node_id: str
+    last_registry_update: float = 0.0
+    last_peer_update: float = 0.0
 
 
 @dataclass
@@ -270,12 +274,20 @@ class MessageBuilder:
             .add_uint16(p.public_port)
             .add_uint64(int(p.uptime_since * 1_000_000))
             .add_fixed_bytes(p.signature)
+            .add_uint64(int(p.last_registry_update * 1_000_000))
+            .add_uint64(int(p.last_peer_update * 1_000_000))
             .build()
         )
 
     @staticmethod
     def ping(p: PingPayload) -> bytes:
-        return PayloadBuilder().add_string(p.node_id).build()
+        return (
+            PayloadBuilder()
+            .add_string(p.node_id)
+            .add_uint64(int(p.last_registry_update * 1_000_000))
+            .add_uint64(int(p.last_peer_update * 1_000_000))
+            .build()
+        )
 
     @staticmethod
     def ack(p: AckPayload) -> bytes:
@@ -499,19 +511,47 @@ class MessageParser:
     @staticmethod
     def hello(data: bytes) -> HelloPayload:
         r = PayloadReader(data)
+        node_id = r.read_string()
+        public_key = r.read_fixed_bytes(32)
+        public_ip = r.read_string()
+        public_port = r.read_uint16()
+        uptime_since = r.read_uint64() / 1_000_000.0
+        signature = r.read_fixed_bytes(64)
+        # V2 extension fields (default to 0 if payload too short)
+        last_registry_update = 0.0
+        last_peer_update = 0.0
+        try:
+            last_registry_update = r.read_uint64() / 1_000_000.0
+            last_peer_update = r.read_uint64() / 1_000_000.0
+        except (IndexError, struct.error):
+            pass
         return HelloPayload(
-            node_id=r.read_string(),
-            public_key=r.read_fixed_bytes(32),
-            public_ip=r.read_string(),
-            public_port=r.read_uint16(),
-            uptime_since=r.read_uint64() / 1_000_000.0,
-            signature=r.read_fixed_bytes(64),
+            node_id=node_id,
+            public_key=public_key,
+            public_ip=public_ip,
+            public_port=public_port,
+            uptime_since=uptime_since,
+            signature=signature,
+            last_registry_update=last_registry_update,
+            last_peer_update=last_peer_update,
         )
 
     @staticmethod
     def ping(data: bytes) -> PingPayload:
         r = PayloadReader(data)
-        return PingPayload(node_id=r.read_string())
+        node_id = r.read_string()
+        last_registry_update = 0.0
+        last_peer_update = 0.0
+        try:
+            last_registry_update = r.read_uint64() / 1_000_000.0
+            last_peer_update = r.read_uint64() / 1_000_000.0
+        except (IndexError, struct.error):
+            pass
+        return PingPayload(
+            node_id=node_id,
+            last_registry_update=last_registry_update,
+            last_peer_update=last_peer_update,
+        )
 
     @staticmethod
     def ack(data: bytes) -> AckPayload:

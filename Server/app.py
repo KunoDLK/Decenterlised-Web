@@ -205,9 +205,28 @@ class App:
         # Register scheduler action handlers
         self._register_scheduler_handlers()
 
+        # Update timestamps for keepalive data-freshness signalling
+        self.last_registry_update: float = 0.0
+        self.last_peer_update: float = 0.0
+
         # Web app / TUI (created later)
         self.web_app = None
         self.tui = None
+
+    def _get_update_timestamps(self) -> tuple[float, float]:
+        """Return (last_registry_update, last_peer_update) for keepalives."""
+        # Sync to udp_engine so lan_broadcast picks up latest
+        self.udp_engine.last_registry_update = self.last_registry_update
+        self.udp_engine.last_peer_update = self.last_peer_update
+        return (self.last_registry_update, self.last_peer_update)
+
+    def _mark_registry_updated(self) -> None:
+        """Called whenever the file registry changes."""
+        self.last_registry_update = time.time()
+
+    def _mark_peer_updated(self) -> None:
+        """Called whenever a peer connects or disconnects."""
+        self.last_peer_update = time.time()
 
     # ==================================================================
     # Packet handler — called by UDP engine recv thread
@@ -221,13 +240,17 @@ class App:
         sender_prefix = wm.sender_id_prefix.hex()
         sender_id = udp.resolve_node_id(from_addr) or sender_prefix
         self.peer_book.mark_seen(sender_id)
-        if self.reliable.is_duplicate(sender_id, wm.seq_num):
-            return
+        # HELLO, PING, and ACK are liveness/control signals — never drop as duplicates
+        if msg_type not in (MsgType.HELLO, MsgType.PING, MsgType.ACK):
+            if self.reliable.is_duplicate(sender_id, wm.seq_num):
+                return
         try:
             if msg_type == MsgType.HELLO:
                 self._on_hello(wm, sender_id, from_addr)
             elif msg_type == MsgType.PING:
                 self._on_ping(wm, sender_id)
+            elif msg_type == MsgType.ACK:
+                self._on_ack(wm, sender_id)
             elif msg_type == MsgType.PEER_LIST_REQUEST:
                 self._on_peer_list_request(sender_id)
             elif msg_type == MsgType.PEER_LIST_RESPONSE:
@@ -296,21 +319,56 @@ class App:
         )
         self.udp_engine._addr_cache[from_addr] = p.node_id
 
+        # Clean up any loopback-discovery placeholder for this address
+        self.peer_book.cleanup_placeholder(from_addr[0], from_addr[1], p.node_id)
+
+        # Check if peer has newer data than we do
+        if p.last_registry_update > self.last_registry_update:
+            self._log.debug("Peer %s has newer registry (%.0fs > %.0fs)",
+                           p.node_id[:12], p.last_registry_update, self.last_registry_update)
+            self.scheduler.enqueue(
+                Action.normal(ActionType.EXCHANGE_REGISTRY, delay=1.0)
+            )
+
         if was_new:
             self._log.info("New peer %s from %s:%d", p.node_id[:12], *from_addr)
+            self._mark_peer_updated()
             self.event_bus.emit("peer_connected", node_id=p.node_id)
             self.scheduler.enqueue_at_front(
                 Action.critical(ActionType.SEND_HELLO_REPLY, peer_id=p.node_id)
+            )
+            # Start PING keepalives to this peer
+            self.scheduler.enqueue(
+                Action.low(ActionType.PING_PEER,
+                          delay=self.config.keepalive_interval,
+                          peer_id=p.node_id)
             )
         self.scheduler.cancel_by_type(
             ActionType.CHECK_PING_RESPONSE, {"peer_id": p.node_id}
         )
 
     def _on_ping(self, wm, sender_id: str) -> None:
+        p = MessageParser.ping(wm.payload)
         self.peer_book.record_ping_received(sender_id)
         self.scheduler.cancel_by_type(
             ActionType.CHECK_PING_RESPONSE, {"peer_id": sender_id}
         )
+        # If peer has newer data, queue an exchange
+        if p.last_registry_update > self.last_registry_update:
+            self._log.debug("PING from %s: peer registry newer, queuing exchange", sender_id[:12])
+            self.scheduler.enqueue(
+                Action.normal(ActionType.EXCHANGE_REGISTRY, delay=0.5)
+            )
+        if p.last_peer_update > self.last_peer_update:
+            self._log.debug("PING from %s: peer list newer, queuing peer list request", sender_id[:12])
+            self.scheduler.enqueue(
+                Action.normal(ActionType.REQUEST_PEER_LIST, delay=0.5)
+            )
+
+    def _on_ack(self, wm, sender_id: str) -> None:
+        """Handle ACK — cancels pending retransmit for the acked message."""
+        p = MessageParser.ack(wm.payload)
+        self.reliable.ack_received(sender_id, p.ack_seq_num)
 
     def _on_peer_list_request(self, sender_id: str) -> None:
         if sender_id:
@@ -341,6 +399,7 @@ class App:
     def _on_file_registry_response(self, wm) -> None:
         p = MessageParser.file_registry_response(wm.payload)
         self.file_registry.merge_delta(p.entries)
+        self._mark_registry_updated()
         self.replication.receive_target_estimate(p.estimated_network_target)
 
     def _on_file_registry_push(self, wm, sender_id: str) -> None:
@@ -444,6 +503,7 @@ class App:
     def _on_file_announce(self, wm) -> None:
         p = MessageParser.file_announce(wm.payload)
         self.file_registry.increment_replica(p.file_id, p.node_id)
+        self._mark_registry_updated()
 
     def _on_replication_solicit(self, wm, sender_id: str) -> None:
         p = MessageParser.replication_solicit(wm.payload)
@@ -477,6 +537,7 @@ class App:
             timestamp=p.timestamp,
         )
         self.file_registry.add(entry)
+        self._mark_registry_updated()
         self.event_bus.emit("file_added", file_id=p.file_id)
         if not self.storage.has_file(p.file_id) and self.storage.available_bytes() >= p.file_size:
             self._log.info("Replicating %s from %s", p.file_id[:12], sender_id[:12])
@@ -506,6 +567,7 @@ class App:
             timestamp=p.timestamp, previous_file_id=p.previous_file_id,
         )
         self.file_registry.add(entry)
+        self._mark_registry_updated()
         self.event_bus.emit("file_updated", file_id=p.file_id)
 
     def _on_file_delete(self, wm) -> None:
@@ -519,6 +581,7 @@ class App:
         if existing and existing.author_id != p.author_id:
             return
         self.file_registry.mark_deleted(p.file_id)
+        self._mark_registry_updated()
         self.storage.delete_file(p.file_id)
         self.event_bus.emit("file_deleted", file_id=p.file_id)
 
@@ -582,6 +645,7 @@ class App:
         self.peer_book.set_connection_state(sender_id, "DISCONNECTED")
         self.file_registry.remove_peer_replicas(sender_id)
         self.reliable.discard_all_for_peer(sender_id)
+        self._mark_peer_updated()
         self.event_bus.emit("peer_disconnected", node_id=sender_id)
 
     # ==================================================================
@@ -622,7 +686,8 @@ class App:
         elif sub == "file_registry_response":
             self._send_file_registry_response(peer_id)
         else:
-            hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+            ru, pu = self._get_update_timestamps()
+            hello = MessageBuilder.hello(self.udp_engine._build_hello_payload(ru, pu))
             self.udp_engine.send_to(peer_id, MsgType.HELLO, hello)
 
     def _act_send_chunk(self, action: Action) -> None:
@@ -770,7 +835,8 @@ class App:
         if delay:
             time.sleep(delay)
         self.peer_book.set_connection_state(peer_id, "PUNCHING", ip, port)
-        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+        ru, pu = self._get_update_timestamps()
+        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload(ru, pu))
         encoded = wire.encode(
             1, MsgType.HELLO, self.node_identity.node_id, 0, hello
         )
@@ -786,9 +852,7 @@ class App:
         )
 
     def _act_lan_broadcast(self, action: Action) -> None:
-        connected = len(self.peer_book.get_connected_peers())
-        if connected < self.config.lan_broadcast_min_peers:
-            self.udp_engine.lan_broadcast()
+        self.udp_engine.lan_broadcast()
         self.scheduler.enqueue(
             Action.low(ActionType.LAN_BROADCAST, delay=self.config.lan_broadcast_interval)
         )
@@ -800,7 +864,12 @@ class App:
         cs = self.peer_book.get_connection_state(peer_id)
         if cs is None or cs["state"] != "CONNECTED":
             return
-        ping = MessageBuilder.ping(PingPayload(node_id=self.node_identity.node_id))
+        ru, pu = self._get_update_timestamps()
+        ping = MessageBuilder.ping(PingPayload(
+            node_id=self.node_identity.node_id,
+            last_registry_update=ru,
+            last_peer_update=pu,
+        ))
         self.udp_engine.send_to(peer_id, MsgType.PING, ping)
         self.peer_book.record_ping_sent(peer_id)
         self.scheduler.enqueue(
@@ -844,6 +913,7 @@ class App:
                 self.peer_book.set_connection_state(nid, "DISCONNECTED")
                 self.file_registry.remove_peer_replicas(nid)
                 self.reliable.discard_all_for_peer(nid)
+                self._mark_peer_updated()
                 self.event_bus.emit("peer_disconnected", node_id=nid)
         self.scheduler.enqueue(
             Action.low(ActionType.LIVENESS_CHECK, delay=self.config.keepalive_interval)
@@ -954,6 +1024,7 @@ class App:
             timestamp=timestamp_us,
         )
         self.file_registry.add(entry)
+        self._mark_registry_updated()
 
         payload = FilePublishPayload(
             file_id=file_id, file_name=file_name, file_size=len(data),
@@ -1058,6 +1129,7 @@ class App:
             timestamp=timestamp_us, previous_file_id=file_id,
         )
         self.file_registry.add(entry)
+        self._mark_registry_updated()
         self.event_bus.emit("file_updated", file_id=new_file_id)
         return new_file_id
 
@@ -1084,6 +1156,7 @@ class App:
         )
         self.udp_engine.broadcast(MsgType.FILE_DELETE, MessageBuilder.file_delete(payload))
         self.file_registry.mark_deleted(file_id)
+        self._mark_registry_updated()
         self.storage.delete_file(file_id)
         self.event_bus.emit("file_deleted", file_id=file_id)
 
@@ -1108,7 +1181,8 @@ class App:
         self.peer_book.set_connection_state(node_id, "PUNCHING", ip, port)
 
         # Send hello packets directly (don't block the scheduler)
-        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload())
+        ru, pu = self._get_update_timestamps()
+        hello = MessageBuilder.hello(self.udp_engine._build_hello_payload(ru, pu))
         encoded = wire.encode(1, MsgType.HELLO, self.node_identity.node_id, 0, hello)
         for _ in range(self.config.hole_punch_packets):
             try:
@@ -1147,15 +1221,53 @@ class App:
     def start(self) -> None:
         """Start the node."""
         self._log.info("Node ID: %s", self.node_identity.node_id)
-        self._log.info("Listening on UDP port %s", self.port)
+        self._log.info("Listening on UDP port %s", self.udp_engine.port)
         print(f"Node ID: {self.node_identity.node_id}")
-        print(f"Listening on UDP port {self.port}")
+        print(f"Listening on UDP port {self.udp_engine.port}")
 
         # Start UDP engine (spawns recv thread)
         self.udp_engine.start()
         self._log.info("Public address: %s:%s",
                         self.udp_engine.public_ip, self.udp_engine.public_port)
         print(f"Public address: {self.udp_engine.public_ip}:{self.udp_engine.public_port}")
+
+        # Loopback discovery: try HELLO-punch to skipped ports (other local instances)
+        for skipped in self.udp_engine.skipped_ports:
+            placeholder_id = hashlib.sha256(
+                f"loopback:127.0.0.1:{skipped}".encode()
+            ).hexdigest()[:16]
+            self.peer_book.add_or_update(
+                placeholder_id, b"", "127.0.0.1", skipped, time.time()
+            )
+            self._log.info("Loopback discovery: attempting 127.0.0.1:%d", skipped)
+            self.scheduler.enqueue(
+                Action.normal(
+                    ActionType.HOLE_PUNCH_PEER,
+                    peer_id=placeholder_id,
+                    ip="127.0.0.1",
+                    port=skipped,
+                )
+            )
+
+        # Loopback discovery for --tui-port-offset: probe the base port (without offset)
+        if self.config.tui_port_offset != 0:
+            base_port = self.port - self.config.tui_port_offset
+            if base_port > 0 and base_port != self.port:
+                placeholder_id = hashlib.sha256(
+                    f"loopback:127.0.0.1:{base_port}".encode()
+                ).hexdigest()[:16]
+                self.peer_book.add_or_update(
+                    placeholder_id, b"", "127.0.0.1", base_port, time.time()
+                )
+                self._log.info("Loopback discovery: tui-offset, probing base port 127.0.0.1:%d", base_port)
+                self.scheduler.enqueue(
+                    Action.normal(
+                        ActionType.HOLE_PUNCH_PEER,
+                        peer_id=placeholder_id,
+                        ip="127.0.0.1",
+                        port=base_port,
+                    )
+                )
 
         # Seed periodic scheduler actions
         self._seed_periodic_actions()
@@ -1369,7 +1481,7 @@ def main() -> None:
         default=os.environ.get("DECWEB_PASS"),
         help="Author password",
     )
-    parser.add_argument("--port", "-P", type=int, default=9000, help="UDP listen port")
+    parser.add_argument("--port", "-P", type=int, default=32128, help="UDP listen port")
     parser.add_argument("--no-tui", action="store_true", help="Disable terminal UI")
     parser.add_argument("--web-port", type=int, default=9001, help="Web UI port (0 = disable)")
     parser.add_argument("--web-host", default="127.0.0.1", help="Web UI bind address")

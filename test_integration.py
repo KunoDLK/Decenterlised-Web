@@ -160,6 +160,7 @@ class IntegrationTest:
             tui_port_offset=tui_offset,
             log=None,
             udp_trace=None,
+            debug=False,
         )
 
     # ------------------------------------------------------------------

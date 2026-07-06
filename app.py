@@ -180,7 +180,7 @@ class App:
         )
 
         # Unified scheduler (replaces all timer threads)
-        self.scheduler = Scheduler()
+        self.scheduler = Scheduler(debug=getattr(args, "debug", False))
 
         # UDP engine (thin — just socket + recv + send)
         self.udp_engine = UDPEngine(
@@ -1377,6 +1377,10 @@ def main() -> None:
     parser.add_argument(
         "--tui-port-offset", type=int, default=0,
         help="Offset added to all ports for multi-instance testing",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable scheduler queue debug logging",
     )
 
     args = parser.parse_args()

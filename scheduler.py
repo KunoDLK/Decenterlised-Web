@@ -57,6 +57,14 @@ class Action:
     params: dict[str, Any] = field(default_factory=dict, compare=False)
     action_id: str = field(default_factory=lambda: uuid.uuid4().hex, compare=False)
 
+    def __repr__(self) -> str:
+        delay = max(0, self.scheduled_at - time.monotonic())
+        return (
+            f"Action({self.action_type} id={self.action_id[:8]} "
+            f"pri={self.priority} in={delay:.3f}s "
+            f"params={_summarise_params(self.params)})"
+        )
+
     @classmethod
     def critical(cls, action_type: str, **params: Any) -> "Action":
         return cls(
@@ -96,6 +104,22 @@ class Action:
             action_type=action_type,
             params=params,
         )
+
+
+Priority = Priority  # re-export for brevity
+
+
+def _summarise_params(params: dict[str, Any]) -> str:
+    """Compact param summary for log lines — truncates long values."""
+    if not params:
+        return "{}"
+    items: list[str] = []
+    for k, v in params.items():
+        s = str(v)
+        if len(s) > 40:
+            s = s[:37] + "..."
+        items.append(f"{k}={s}")
+    return "{" + ", ".join(items) + "}"
 
 
 # ===================================================================
@@ -158,7 +182,7 @@ class Scheduler:
     Thread-safe: enqueue/cancel can be called from any thread.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, debug: bool = False) -> None:
         self._heap: list[Action] = []
         self._pending: dict[str, Action] = {}   # action_id → Action (for cancellation)
         self._cancelled: set[str] = set()        # lazy-delete set
@@ -168,6 +192,8 @@ class Scheduler:
         self._seq_counter: int = 0
         self.running: bool = False
         self._stop_event = threading.Event()
+        self.debug: bool = debug
+        self._tick_count: int = 0
 
     # ------------------------------------------------------------------
     # Registration
@@ -198,6 +224,9 @@ class Scheduler:
         with self._lock:
             heapq.heappush(self._heap, action)
             self._pending[action.action_id] = action
+            heap_size = len(self._heap)
+        if self.debug:
+            _log.debug("ENQ %s  (heap=%d pending=%d)", action, heap_size, len(self._pending))
         self._wake_event.set()
         return action.action_id
 
@@ -208,7 +237,10 @@ class Scheduler:
         """
         action.scheduled_at = 0
         action.priority = Priority.CRITICAL
-        return self.enqueue(action)
+        aid = self.enqueue(action)
+        if self.debug:
+            _log.debug("ENQ-FRONT %s", action)
+        return aid
 
     def cancel(self, action_id: str) -> bool:
         """Cancel a pending action by ID. Returns True if found.
@@ -218,8 +250,11 @@ class Scheduler:
         """
         with self._lock:
             if action_id in self._pending:
+                action = self._pending[action_id]
                 self._cancelled.add(action_id)
                 self._pending.pop(action_id, None)
+                if self.debug:
+                    _log.debug("CANCEL %s", action)
                 return True
         return False
 
@@ -246,6 +281,9 @@ class Scheduler:
                 self._cancelled.add(aid)
                 self._pending.pop(aid, None)
                 count += 1
+        if self.debug and count > 0:
+            _log.debug("CANCEL-TYPE %s x%d  (match=%s)", action_type, count,
+                       _summarise_params(match_params or {}))
         return count
 
     # ------------------------------------------------------------------
@@ -278,12 +316,20 @@ class Scheduler:
 
     def _tick(self) -> None:
         """One iteration: pop and execute all ready actions, then wait."""
+        self._tick_count += 1
+
         # Drain all ready actions
+        executed = 0
         while self.running:
             action = self._pop_ready()
             if action is None:
                 break
             self._execute(action)
+            executed += 1
+
+        if self.debug and executed > 0:
+            _log.debug("TICK #%d  executed=%d  heap=%d",
+                       self._tick_count, executed, len(self._heap))
 
         # Wait for next action or wake signal
         if not self.running:
@@ -291,7 +337,6 @@ class Scheduler:
 
         timeout = self._time_until_next()
         if timeout is None:
-            # No pending actions — wait indefinitely for wake
             self._wake_event.wait(timeout=1.0)
         elif timeout > 0:
             self._wake_event.wait(timeout=min(timeout, 1.0))
@@ -306,8 +351,12 @@ class Scheduler:
                 action = heapq.heappop(self._heap)
                 if action.action_id in self._cancelled:
                     self._cancelled.discard(action.action_id)
+                    if self.debug:
+                        _log.debug("DEQ-SKIP (cancelled) %s", action)
                     continue
                 self._pending.pop(action.action_id, None)
+                if self.debug:
+                    _log.debug("DEQ %s", action)
                 return action
         return None
 
@@ -324,6 +373,8 @@ class Scheduler:
         if handler is None:
             _log.warning("No handler for action type: %s", action.action_type)
             return
+        if self.debug:
+            _log.debug("EXEC %s", action)
         try:
             handler(action)
         except Exception:

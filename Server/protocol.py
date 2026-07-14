@@ -127,7 +127,8 @@ class FileRegistryEntry:
 
 @dataclass
 class FileRegistryQueryPayload:
-    pass
+    last_registry_update: float = 0.0
+    registry_hash: str = ""
 
 
 @dataclass
@@ -316,8 +317,14 @@ class MessageBuilder:
         return pb.build()
 
     @staticmethod
-    def file_registry_query() -> bytes:
-        return b""
+    def file_registry_query(p: Optional[FileRegistryQueryPayload] = None) -> bytes:
+        p = p or FileRegistryQueryPayload()
+        return (
+            PayloadBuilder()
+            .add_uint64(int(p.last_registry_update * 1_000_000))
+            .add_string(p.registry_hash)
+            .build()
+        )
 
     @staticmethod
     def file_registry_response(p: FileRegistryResponsePayload) -> bytes:
@@ -589,7 +596,22 @@ class MessageParser:
 
     @staticmethod
     def file_registry_query(data: bytes) -> FileRegistryQueryPayload:
-        return FileRegistryQueryPayload()
+        r = PayloadReader(data)
+        # Backward-compatible parse: older peers may send empty payload.
+        if r.remaining() == 0:
+            return FileRegistryQueryPayload()
+        last_update = 0.0
+        reg_hash = ""
+        try:
+            last_update = r.read_uint64() / 1_000_000.0
+            if r.remaining() > 0:
+                reg_hash = r.read_string()
+        except (IndexError, struct.error):
+            pass
+        return FileRegistryQueryPayload(
+            last_registry_update=last_update,
+            registry_hash=reg_hash,
+        )
 
     @staticmethod
     def file_registry_response(data: bytes) -> FileRegistryResponsePayload:

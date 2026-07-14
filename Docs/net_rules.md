@@ -124,6 +124,8 @@
 | `rebalance_interval` | **60 seconds** | Time between rebalance cycles |
 | `network_target_min` | **3** | Minimum replica count per file |
 | `network_target_max` | **10** | Maximum replica count per file |
+| `replica_tolerance_band` | **±1** | Healthy band around target — no rebalance action within it (prevents thrashing) |
+| `rebalance_min_peers` | **3** | Minimum connected peers before rebalancing may act (gate) |
 | `temporary_replica_ttl` | **3600 seconds** | 1 hour before temp replica becomes permanent |
 | `min_publish_bytes` | **1 MB** | Minimum bytes available to allow publishing |
 
@@ -280,9 +282,10 @@
 
 ### 11. Solicit Replication (`_act_solicit_replication`)
 
+- Triggered automatically by scheduler actions (for example from `FILE_PUBLISH` handling or rebalance decisions); never requires manual user interaction.
 - If `storage.has_file(file_id)` → just call `increment_replica`, skip download
 - Otherwise: call `download_file(file_id)` — **blocking** download
-- On success: `store_replica(file_id, data)`, `increment_replica`
+- On success: `store_replica(file_id, data)`, `increment_replica`, broadcast `FILE_ANNOUNCE` so the network immediately counts this node as a host
 - On failure: log warning
 - Emit `file_added` event
 
@@ -345,13 +348,18 @@
 ### 16. Registry Exchange (`_act_exchange_registry`)
 
 **Runs on startup, or when peer PING/HELLO indicates newer data:**
-- Send `FILE_REGISTRY_QUERY` to all connected peers
+- Send `FILE_REGISTRY_QUERY` carrying the local `last_registry_update` timestamp (and, when available, a registry digest/hash) to connected peers
+- The peer replies with only the **delta** — entries changed since the requester's timestamp — never the full registry. This keeps sync cost bounded as the network's file count grows (scales with churn, not total files)
 - ✅ Reliable delivery (auto-ACK)
 
+**On receiving `FILE_REGISTRY_QUERY`:**
+- If the peer's digest already matches the local registry → respond with an empty delta (nothing to transfer)
+- Otherwise compute and send `FILE_REGISTRY_RESPONSE` with only the entries newer than the requester's `last_registry_update`
+
 **On receiving `FILE_REGISTRY_RESPONSE`:**
-- `merge_delta(entries)` — merge peer's registry entries into local DB
+- `merge_delta(entries)` — merge peer's registry entries into local DB (**latest-timestamp-wins** on conflicting updates to the same file)
 - `_mark_registry_updated()`
-- Update `estimated_network_target` for replication
+- Merge the peer's `estimated_network_target` via **median** of received estimates (see Replication & Network Target)
 
 **On receiving `FILE_REGISTRY_PUSH`:**
 - Update single entry in registry
@@ -363,9 +371,9 @@
 
 - Send `PEER_LIST_REQUEST` to connected peers
 - Peer responds with `PEER_LIST_RESPONSE` containing:
-  - `peers[]`: list of `(node_id, public_ip, public_port, uptime_since)`
+  - `peers[]`: list of `(node_id, public_ip, public_port, uptime_since)` — **only actively connected peers are shared**. Stale/offline addresses are omitted, since hole punching requires both sides online, so gossiping dead peers wastes bandwidth and slows convergence
   - `estimated_network_target`: replication target value
-- On receive: `add_or_update()` each peer, update replication target
+- On receive: `add_or_update()` each peer (**deduplicate by node_id**), merge `estimated_network_target` via **median** of received values
 
 ---
 
@@ -443,26 +451,35 @@
 
 ### 22. Rebalance (`_act_rebalance`)
 
-**Runs every `rebalance_interval` (60s):**
-1. `calculate_network_target()` — determine target replica count (3–10)
-2. `execute_rebalance()`:
-   - Find under-replicated files
-   - Send `REPLICATION_SOLICIT` to connected peers
-   - On `REPLICATION_ACK` → `increment_replica(file_id, node_id)`
-3. Re-queue self at **NORMAL** priority, `rebalance_interval` (60s) delay
+**Rebalancing gate (never act on stale data):**
+- Skip the cycle unless the node has an accurate network picture: either **≥ `rebalance_min_peers` (3) connected peers**, OR all Tier 1 peers have been contacted (see Peer Book Tiering)
+- Wait until `FILE_REGISTRY_RESPONSE` has been received from all connected peers before evaluating deletions/replications — this prevents deleting files that only *appear* over-replicated because not every peer has reported yet
+
+**Runs every `rebalance_interval` (60s), once the gate passes:**
+1. `calculate_network_target()` — `floor(Σ contributing_storage / Σ unique_file_size)`, clamped to `network_target_min` (3) .. `network_target_max` (10); converge with peers via **median** of gossiped `estimated_network_target`
+2. Classify each file against the target using the **±1 tolerance band** (`replica_tolerance_band`) to prevent thrashing:
+   - `replica_count > network_target + 1` → **over-replicated** → candidate for local deletion
+   - `network_target - 1 ≤ replica_count ≤ network_target + 1` → **healthy** → no action
+   - `replica_count < network_target - 1` → **under-replicated** → candidate for replication
+3. `execute_rebalance()`:
+  - **Under-replicated + spare capacity:** choose files to mirror with a **storage-diversity preference** — prefer files whose existing replica-holders overlap least with this node's connected peers, so a single peer outage drops at most one file. Automatically send `REPLICATION_SOLICIT` without user action; the selected peer then auto-runs `_act_solicit_replication` to download and host the file. On `REPLICATION_ACK` → `increment_replica(file_id, node_id)`
+   - **Under-replicated + storage full:** delete the most over-replicated local file (highest `replica_count`, `> network_target + 1`) to free space, then replicate the vulnerable file
+   - **Originator protection:** the original publisher always keeps its own file regardless of replica count — never deleted during rebalance
+4. Re-queue self at **NORMAL** priority, `rebalance_interval` (60s) delay
 
 ---
 
 ### 23. Reconnect Sequence (startup)
 
-1. Read peer book database for known peers
-2. For each peer with state `CONNECTED`:
-   - Queue `EXCHANGE_REGISTRY` (NORMAL, staggered delays)
-   - Queue `REQUEST_PEER_LIST` (NORMAL, staggered delays)
-3. For disconnected/unreachable peers:
-   - Queue `HOLE_PUNCH_PEER` (NORMAL)
-4. Queue initial `LAN_BROADCAST` (LOW, 5s delay)
-5. Add bootstrap peers if book is empty
+Peers are ranked by tier from the peer book (see Peer Book Tiering). Reconnection proceeds in phases so the node never rebalances on an incomplete picture — critical for correctness as the network scales.
+
+1. **Load peer book**, sort by tier (Tier 1 → Tier 2 → Tier 3)
+2. **Phase 0 — Bootstrap:** if the book is empty or all tiers are exhausted, queue `HOLE_PUNCH_PEER` to hardcoded bootstrap peers
+3. **Phase 1 — Critical peers:** queue `HOLE_PUNCH_PEER` to all **Tier 1** peers (author of a file you store, or host of a replica of a file you authored). If a direct punch fails and a connected peer knows the target → request peer-assisted connection (CONNECT_REQUEST)
+4. **Phase 2 — Assess:** once ≥1 Tier 1 peer responds (or Tier 1 is exhausted), queue `EXCHANGE_REGISTRY` and `REQUEST_PEER_LIST` (NORMAL, staggered delays) to all connected peers and collect registry responses
+5. **Phase 3 — Rebalance:** only now, and only if the rebalancing gate passes (Rule 22), evaluate deletions/replications
+6. **Phase 4 — Broaden:** queue `HOLE_PUNCH_PEER` to Tier 2 then Tier 3 peers; request their peer lists to discover new peers
+7. **Phase 5 — Broadcast:** queue initial `LAN_BROADCAST` (LOW, 5s delay) to find local peers
 
 ---
 
@@ -490,6 +507,41 @@
 4. Send `hole_punch_packets` (3) HELLOs inline (not via scheduler)
 5. Queue `CHECK_HOLE_PUNCH` (HIGH, 5s)
 6. If peer responds with HELLO → `_on_hello` transitions to `CONNECTED`
+
+---
+
+## Peer Book Tiering
+
+The peer book (SQLite) assigns each peer a relevance tier so reconnection and rebalancing scale gracefully — critical peers are contacted first, and the node reaches an accurate picture quickly without waiting on the whole network.
+
+| Tier | Criteria | Rationale |
+|---|---|---|
+| **Tier 1 — Critical** | Peer is author of a file in local storage, OR peer hosts a replica of a file this node authored | Determines the health of files this node cares about |
+| **Tier 2 — Recent** | Last seen within 7 days and previously connected successfully | Likely still online; good for general network view |
+| **Tier 3 — General** | All other known peers | Fallback for bootstrapping into the network |
+
+- Tiers are recalculated whenever the local file registry changes
+- On `PEER_LIST_RESPONSE`: merge new peers (deduplicate by node_id)
+- On `GOODBYE` or timeout: mark offline, keep in book
+- Peers failing to connect 5+ consecutive times: demote one tier
+- Periodic cleanup (`peer_cleanup_interval`, 1h): remove peers not seen in `peer_cleanup_max_age_days` (30 days)
+
+---
+
+## Replication & Network Target
+
+Each node continuously estimates the sustainable replica count from its partial view, so the network converges without central coordination:
+
+```
+network_target = floor(Σ contributing_storage / Σ unique_file_size)
+```
+
+- Clamped to `network_target_min` (3) .. `network_target_max` (10)
+- Gossiped in `PEER_LIST_RESPONSE` and `FILE_REGISTRY_RESPONSE` as `estimated_network_target`
+- Nodes merge received estimates via **median** to converge on a shared value despite partial views
+- Rebalancing acts only on the **±1 tolerance band** (Rule 22) so files at `network_target ± 1` are considered healthy and never trigger churn
+- **Diversity:** when spare capacity allows mirroring, prefer under-replicated files whose replica-holders overlap least with this node's current peers, spreading outage risk across the network
+- **Originator protection:** a publisher never deletes its own file during rebalance
 
 ---
 

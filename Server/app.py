@@ -48,6 +48,7 @@ from protocol import (
     HelloPayload,
     PeerListResponsePayload,
     PeerEntry,
+    FileRegistryQueryPayload,
     FileRegistryResponsePayload,
     FileAnnouncePayload,
     FileChunkAckPayload,
@@ -201,6 +202,10 @@ class App:
             self.udp_engine,
             self.scheduler,
         )
+        self.replication.network_target_min = self.config.network_target_min
+        self.replication.network_target_max = self.config.network_target_max
+        self.replication.rebalance_min_peers = self.config.rebalance_min_peers
+        self.replication.replica_tolerance_band = self.config.replica_tolerance_band
 
         # Register scheduler action handlers
         self._register_scheduler_handlers()
@@ -256,7 +261,7 @@ class App:
             elif msg_type == MsgType.PEER_LIST_RESPONSE:
                 self._on_peer_list_response(wm)
             elif msg_type == MsgType.FILE_REGISTRY_QUERY:
-                self._on_file_registry_query(sender_id)
+                self._on_file_registry_query(wm, sender_id)
             elif msg_type == MsgType.FILE_REGISTRY_RESPONSE:
                 self._on_file_registry_response(wm)
             elif msg_type == MsgType.FILE_REGISTRY_PUSH:
@@ -387,14 +392,19 @@ class App:
             )
         self.replication.receive_target_estimate(p.estimated_network_target)
 
-    def _on_file_registry_query(self, sender_id: str) -> None:
-        if sender_id:
-            self.scheduler.enqueue_at_front(
-                Action.critical(
-                    ActionType.SEND_HELLO_REPLY, peer_id=sender_id,
-                    sub_action="file_registry_response",
-                )
+    def _on_file_registry_query(self, wm, sender_id: str) -> None:
+        if not sender_id:
+            return
+        p = MessageParser.file_registry_query(wm.payload)
+        self.scheduler.enqueue_at_front(
+            Action.critical(
+                ActionType.SEND_HELLO_REPLY,
+                peer_id=sender_id,
+                sub_action="file_registry_response",
+                query_since=p.last_registry_update,
+                query_hash=p.registry_hash,
             )
+        )
 
     def _on_file_registry_response(self, wm) -> None:
         p = MessageParser.file_registry_response(wm.payload)
@@ -518,6 +528,14 @@ class App:
             self.udp_engine.send_to(
                 sender_id, MsgType.REPLICATION_ACK,
                 MessageBuilder.replication_ack(ack),
+            )
+            # Accepted solicitations are performed asynchronously via scheduler.
+            self.scheduler.enqueue(
+                Action.normal(
+                    ActionType.SOLICIT_REPLICATION,
+                    file_id=p.file_id,
+                    from_peer=sender_id,
+                )
             )
 
     def _on_replication_ack(self, wm) -> None:
@@ -688,7 +706,11 @@ class App:
         if sub == "peer_list_response":
             self._send_peer_list_response(peer_id)
         elif sub == "file_registry_response":
-            self._send_file_registry_response(peer_id)
+            self._send_file_registry_response(
+                peer_id,
+                action.params.get("query_since", 0.0),
+                action.params.get("query_hash", ""),
+            )
         else:
             ru, pu = self._get_update_timestamps()
             hello = MessageBuilder.hello(self.udp_engine._build_hello_payload(ru, pu))
@@ -818,10 +840,14 @@ class App:
         )
 
     def _act_exchange_registry(self, action: Action) -> None:
+        query = FileRegistryQueryPayload(
+            last_registry_update=self.last_registry_update,
+            registry_hash=self.file_registry.compute_hash(),
+        )
         for nid in self.peer_book.get_connected_peers():
             self.udp_engine.send_to(
                 nid, MsgType.FILE_REGISTRY_QUERY,
-                MessageBuilder.file_registry_query(),
+                MessageBuilder.file_registry_query(query),
             )
 
     def _act_request_peer_list(self, action: Action) -> None:
@@ -936,7 +962,18 @@ class App:
             data = self.download_file(file_id)
             self.storage.store_replica(file_id, data)
             self.file_registry.increment_replica(file_id, self.node_identity.node_id)
+            announce = FileAnnouncePayload(
+                file_id=file_id,
+                node_id=self.node_identity.node_id,
+                is_temporary=False,
+                signature=b"",
+            )
+            self.udp_engine.broadcast(
+                MsgType.FILE_ANNOUNCE,
+                MessageBuilder.file_announce(announce),
+            )
             self._log.info("Replica stored: %s from %s", file_id[:12], from_peer[:12])
+            self._mark_registry_updated()
             self.event_bus.emit("file_added", file_id=file_id)
         except Exception as e:
             self._log.warning("Replication failed for %s: %s", file_id[:12], e)
@@ -973,8 +1010,14 @@ class App:
             MessageBuilder.peer_list_response(resp),
         )
 
-    def _send_file_registry_response(self, peer_id: str) -> None:
-        entries = self.file_registry.get_all()
+    def _send_file_registry_response(
+        self, peer_id: str, query_since: float = 0.0, query_hash: str = ""
+    ) -> None:
+        local_hash = self.file_registry.compute_hash()
+        if query_hash and query_hash == local_hash:
+            entries: list[FileRegistryEntry] = []
+        else:
+            entries = self.file_registry.get_entries_since(query_since)
         target = self.replication.calculate_network_target()
         resp = FileRegistryResponsePayload(entries=entries, estimated_network_target=target)
         self.udp_engine.send_to(

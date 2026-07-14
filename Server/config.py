@@ -61,6 +61,8 @@ class PeerConfig:
     rebalance_interval: float = 60.0          # seconds between rebalance cycles
     network_target_min: int = 3               # minimum replica count
     network_target_max: int = 10              # maximum replica count
+    replica_tolerance_band: int = 1           # healthy range: target ± band
+    rebalance_min_peers: int = 3              # min connected peers before rebalance
     temporary_replica_ttl: float = 3600.0     # 1 hour before temp → permanent
     min_publish_bytes: int = 1_048_576        # 1 MB min for publishing
 

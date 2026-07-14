@@ -27,6 +27,10 @@ _log = logging.getLogger("replication")
 # ---------------------------------------------------------------------------
 
 REBALANCE_INTERVAL: float = 60.0
+DEFAULT_NETWORK_TARGET_MIN: int = 3
+DEFAULT_NETWORK_TARGET_MAX: int = 10
+DEFAULT_REPLICA_TOLERANCE_BAND: int = 1
+DEFAULT_REBALANCE_MIN_PEERS: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +59,10 @@ class ReplicationManager:
         self.received_targets: list[int] = []
         self.tier1_contacted: set[str] = set()
         self.tier1_total: int = 0
+        self.network_target_min: int = DEFAULT_NETWORK_TARGET_MIN
+        self.network_target_max: int = DEFAULT_NETWORK_TARGET_MAX
+        self.replica_tolerance_band: int = DEFAULT_REPLICA_TOLERANCE_BAND
+        self.rebalance_min_peers: int = DEFAULT_REBALANCE_MIN_PEERS
 
     # ------------------------------------------------------------------
     # Network target
@@ -65,14 +73,19 @@ class ReplicationManager:
         # Estimate total network storage from peer count * average storage
         peer_count = self.peer_book.count()
         if peer_count == 0:
-            return 3
+            self.estimated_network_target = self.network_target_min
+            return self.estimated_network_target
         # Conservative: assume each peer has 500MB
         total_storage = peer_count * 500 * 1024 * 1024
         total_files = self.file_registry.total_unique_file_size()
         if total_files == 0:
-            return max(3, peer_count // 2)
+            self.estimated_network_target = max(self.network_target_min, peer_count // 2)
+            return self.estimated_network_target
         target = total_storage // max(total_files, 1)
-        return max(3, min(target, 10))  # clamp between 3 and 10
+        self.estimated_network_target = max(
+            self.network_target_min, min(target, self.network_target_max)
+        )
+        return self.estimated_network_target
 
     def receive_target_estimate(self, value: int) -> None:
         """Record an estimate from a peer, recalculate median."""
@@ -81,7 +94,10 @@ class ReplicationManager:
             self.estimated_network_target = int(
                 statistics.median(self.received_targets)
             )
-        self.estimated_network_target = max(3, self.estimated_network_target)
+        self.estimated_network_target = max(
+            self.network_target_min,
+            min(self.estimated_network_target, self.network_target_max),
+        )
 
     def open_gate(self) -> None:
         """Allow rebalancing."""
@@ -96,7 +112,7 @@ class ReplicationManager:
             self.tier1_total > 0
             and len(self.tier1_contacted) >= self.tier1_total
         )
-        return connected >= 3 or all_tier1_done
+        return connected >= self.rebalance_min_peers or all_tier1_done
 
     # ------------------------------------------------------------------
     # Replication levels
@@ -105,35 +121,39 @@ class ReplicationManager:
     def get_under_replicated(self) -> list["FileRegistryEntry"]:
         """Files where replica_count < networkTarget - 1."""
         target = self.estimated_network_target
+        threshold = max(0, target - self.replica_tolerance_band)
         return [
             e
             for e in self.file_registry.get_all()
-            if e.replica_count < target - 1
+            if e.replica_count < threshold
         ]
 
     def get_over_replicated(self) -> list["FileRegistryEntry"]:
         """Files where replica_count > networkTarget + 1, locally stored."""
         target = self.estimated_network_target
+        threshold = target + self.replica_tolerance_band
         return [
             e
             for e in self.file_registry.get_all()
-            if e.replica_count > target + 1 and self.storage.has_file(e.file_id)
+            if e.replica_count > threshold and self.storage.has_file(e.file_id)
         ]
 
     def get_at_target_low(self) -> list["FileRegistryEntry"]:
         """Files at replica_count == networkTarget - 1."""
         target = self.estimated_network_target
+        threshold = max(0, target - self.replica_tolerance_band)
         return [
-            e for e in self.file_registry.get_all() if e.replica_count == target - 1
+            e for e in self.file_registry.get_all() if e.replica_count == threshold
         ]
 
     def get_at_target_high(self) -> list["FileRegistryEntry"]:
         """Files at replica_count == networkTarget + 1, locally stored."""
         target = self.estimated_network_target
+        threshold = target + self.replica_tolerance_band
         return [
             e
             for e in self.file_registry.get_all()
-            if e.replica_count == target + 1 and self.storage.has_file(e.file_id)
+            if e.replica_count == threshold and self.storage.has_file(e.file_id)
         ]
 
     def get_at_target_exact(self) -> list["FileRegistryEntry"]:
